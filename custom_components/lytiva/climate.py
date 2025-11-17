@@ -1,240 +1,947 @@
-"""Lytiva IR AC (climate) via MQTT discovery."""
-from __future__ import annotations
-import json
-import logging
-from typing import Optional
 
-from homeassistant.components.climate import ClimateEntity
-from homeassistant.components.climate.const import (
-    PRESET_NONE,
+"""Lytiva IR AC Climate via MQTT with enhanced debugging."""
+
+from __future__ import annotations
+
+import logging
+
+import json
+
+from jinja2 import Template
+
+from homeassistant.components.climate import (
+
+    ClimateEntity,
+
+    ClimateEntityFeature,
+
+    HVACMode,
+
 )
+
+from homeassistant.const import UnitOfTemperature
+
 from homeassistant.config_entries import ConfigEntry
+
 from homeassistant.core import HomeAssistant
+
+from homeassistant.helpers.restore_state import RestoreEntity
 
 from . import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
+HVAC_MAP = {
+
+    "cool": HVACMode.COOL,
+
+    "heat": HVACMode.HEAT,
+
+    "dry": HVACMode.DRY,
+
+    "fan_only": HVACMode.FAN_ONLY,
+
+    "auto": HVACMode.AUTO,
+
+    "off": HVACMode.OFF,
+
+}
+
+REVERSE_HVAC = {v: k for k, v in HVAC_MAP.items()}
+
+def _parse_template(template_str, msg_payload):
+
+    """Parse Jinja2 template with payload."""
+
+    if not template_str:
+
+        return None
+
+    try:
+
+        try:
+
+            payload_json = json.loads(msg_payload)
+
+        except:
+
+            payload_json = {}
+
+        
+
+        t = Template(template_str)
+
+        result = t.render(value_json=payload_json, value=msg_payload.decode() if isinstance(msg_payload, bytes) else msg_payload)
+
+        return result.strip()
+
+    except Exception as e:
+
+        _LOGGER.error("Template render error: %s | Template: %s", e, template_str)
+
+        return None
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
-    """Set up Lytiva climate devices dynamically."""
-    mqtt = hass.data[DOMAIN][entry.entry_id]["mqtt_client"]
-    devices = hass.data[DOMAIN][entry.entry_id]["devices"]
 
-    def add_new_climate(device):
-        entity = LytivaIRAC(device, mqtt)
-        async_add_entities([entity], True)
-        _LOGGER.info("IR AC added dynamically: %s", device.get("name"))
+    """Set up climate entities dynamically from MQTT discovery."""
 
-    # Register callback
-    register_cb = hass.data[DOMAIN][entry.entry_id]["register_climate_callback"]
-    register_cb(add_new_climate)
+    integration = hass.data[DOMAIN][entry.entry_id]
 
-    # Add already discovered devices
-    for dev in devices.values():
-        if "mode_state_topic" in dev or "temperature_command_topic" in dev:
-            add_new_climate(dev)
+    mqtt = integration["mqtt_client"]
 
+    devices = integration["devices"]
 
-class LytivaIRAC(ClimateEntity):
-    """Representation of an IR AC as a climate entity."""
+    
 
-    def __init__(self, device: dict, mqtt):
-        self._device = device
-        self._mqtt = mqtt
+    def add_new_climate(payload):
 
-        self._name = device.get("name")
-        self._unique_id = str(device.get("unique_id") or device.get("address"))
-        self._address = device.get("unique_id") or device.get("address")
+        """Add newly discovered climate device."""
 
-        # Topics (from discovery payload)
-        self._state_topic = device.get("mode_state_topic") or device.get("current_temperature_topic") or device.get("target_temperature_topic") or device.get("fan_mode_state_topic")
-        self._command_topic = device.get("mode_command_topic") or device.get("temperature_command_topic") or device.get("fan_mode_command_topic") or device.get("preset_mode_command_topic")
+        _LOGGER.info("Attempting to add climate device: %s", payload.get("name"))
 
-        # Ranges and supported modes from payload (fallbacks)
-        self._hvac_modes = device.get("modes", ["auto", "cool", "dry", "fan_only", "heat"])
-        self._preset_modes = device.get("preset_modes", ["On", "Off"])
-        self._fan_modes = device.get("fan_modes", ["Vlow", "Low", "Med", "High", "Top", "Auto"])
-        self._min_temp = device.get("min_temp", 18)
-        self._max_temp = device.get("max_temp", 30)
-        self._temp_step = device.get("temp_step", 1)
+        _LOGGER.debug("Full climate payload: %s", json.dumps(payload, indent=2))
 
-        # metadata
-        self._manufacturer = device.get("device", {}).get("manufacturer", "Lytiva")
-        self._model = device.get("device", {}).get("model", "IR Blaster AC")
-        self._area = device.get("device", {}).get("suggested_area")
+        
 
-        # internal state
-        self._hvac_mode: Optional[str] = None
-        self._preset_mode: Optional[str] = None
-        self._current_temp: Optional[float] = None
-        self._target_temp: Optional[float] = None
-        self._fan_mode: Optional[str] = None
-        self._available = True
+        if payload.get("mode_state_topic") or payload.get("device_class") == "climate":
 
-        # Subscribe to status topic (if provided)
-        status_topic = device.get("mode_state_topic") or device.get("current_temperature_topic") or device.get("target_temperature_topic") or device.get("fan_mode_state_topic")
-        if status_topic:
-            self._mqtt.message_callback_add(status_topic, self._on_state_message)
-            self._mqtt.subscribe(status_topic)
+            entity = LytivaClimateEntity(hass, entry, payload, mqtt)
 
-    def _on_state_message(self, client, userdata, msg):
+            async_add_entities([entity], True)
+
+            _LOGGER.info("✅ Lytiva climate added: %s (ID: %s)", payload.get("name"), payload.get("unique_id"))
+
+        else:
+
+            _LOGGER.warning("❌ Climate device missing mode_state_topic: %s", payload.get("name"))
+
+    
+
+    register = integration.get("register_climate_callback")
+
+    if register:
+
+        register(add_new_climate)
+
+    
+
+    # Add existing climate devices
+
+    for device_id, payload in devices.items():
+
+        if isinstance(payload, dict):
+
+            # Check multiple conditions for climate devices
+
+            is_climate = (
+
+                payload.get("mode_state_topic") or 
+
+                payload.get("device_class") == "climate" or
+
+                "climate" in payload.get("name", "").lower() or
+
+                payload.get("modes") or
+
+                payload.get("temperature_command_topic")
+
+            )
+
+            
+
+            if is_climate:
+
+                add_new_climate(payload)
+
+class LytivaClimateEntity(ClimateEntity, RestoreEntity):
+
+    """Representation of IR AC (Air Conditioner)."""
+
+    
+
+    def __init__(self, hass, entry, payload, mqtt_client):
+
+        self.hass = hass
+
+        self.entry = entry
+
+        self.payload = payload
+
+        self._mqtt = mqtt_client
+
+        
+
+        self._name = payload.get("name", "Lytiva Climate")
+
+        self._unique_id = payload.get("unique_id") or payload.get("address") or f"lytiva_climate_{id(payload)}"
+
+        self._address = payload.get("address")
+
+        
+
+        # Topics
+
+        self._topic_mode_state = payload.get("mode_state_topic")
+
+        self._topic_mode_cmd = payload.get("mode_command_topic")
+
+        self._topic_temp_cmd = payload.get("temperature_command_topic")
+
+        self._topic_target_temp_state = payload.get("target_temperature_topic")
+
+        self._topic_curr_temp_state = payload.get("current_temperature_topic")
+
+        self._topic_fan_mode_state = payload.get("fan_mode_state_topic")
+
+        self._topic_fan_mode_cmd = payload.get("fan_mode_command_topic")
+
+        self._topic_preset_state = payload.get("preset_mode_state_topic")
+
+        self._topic_preset_cmd = payload.get("preset_mode_command_topic")
+
+        
+
+        # Templates
+
+        self._mode_state_template = payload.get("mode_state_template")
+
+        self._target_temp_template = payload.get("target_temperature_template")
+
+        self._current_temp_template = payload.get("current_temperature_template")
+
+        self._fan_mode_state_template = payload.get("fan_mode_state_template")
+
+        self._preset_mode_state_template = payload.get("preset_mode_state_template")
+
+        
+
+        self._mode_command_template = payload.get("mode_command_template")
+
+        self._temp_command_template = payload.get("temperature_command_template")
+
+        self._fan_mode_command_template = payload.get("fan_mode_command_template")
+
+        self._preset_mode_command_template = payload.get("preset_mode_command_template")
+
+        
+
+        # Supported values
+
+        modes = payload.get("modes", ["cool", "heat", "dry", "fan_only", "auto", "off"])
+
+        self._hvac_modes = [HVAC_MAP.get(m, HVACMode.OFF) for m in modes if m in HVAC_MAP]
+
+        if HVACMode.OFF not in self._hvac_modes:
+
+            self._hvac_modes.append(HVACMode.OFF)
+
+            
+
+        self._fan_modes = payload.get("fan_modes", ["low", "medium", "high", "auto"])
+
+        self._preset_modes = payload.get("preset_modes", ["On", "Off"])
+
+        
+
+        # Device info
+
+        dev_meta = payload.get("device", {})
+
+        self._manufacturer = dev_meta.get("manufacturer", "Lytiva")
+
+        self._model = dev_meta.get("model", "IR AC")
+
+        self._area = dev_meta.get("suggested_area")
+
+        
+
+        # State - START AS AVAILABLE for IR devices (they don't send state updates)
+
+        self._available = True  # Changed to True by default for IR devices
+
+        self._target_temp = 24
+
+        self._current_temp = None
+
+        self._fan_mode = self._fan_modes[0] if self._fan_modes else None
+
+        self._hvac_mode = HVACMode.OFF
+
+        self._preset = "Off"
+
+        
+
+        # Temperature limits
+
+        self._min_temp = payload.get("min_temp", 16)
+
+        self._max_temp = payload.get("max_temp", 30)
+
+        self._temp_step = payload.get("temp_step", 1)
+
+        
+
+        _LOGGER.info("🔧 Climate entity initialized: %s", self._name)
+
+        _LOGGER.info("   Topics - State: %s | Command: %s", self._topic_mode_state, self._topic_mode_cmd)
+
+        _LOGGER.info("   Address: %s | Unique ID: %s", self._address, self._unique_id)
+
+        
+
+        # Subscribe to topics
+
+        self._subscribe_topics()
+
+    
+
+    def _subscribe_topics(self):
+
+        """Subscribe to all relevant MQTT topics."""
+
+        topics = {
+
+            "mode_state": self._topic_mode_state,
+
+            "target_temp": self._topic_target_temp_state,
+
+            "current_temp": self._topic_curr_temp_state,
+
+            "fan_mode": self._topic_fan_mode_state,
+
+            "preset": self._topic_preset_state,
+
+        }
+
+        
+
+        subscribed_count = 0
+
+        for topic_name, topic in topics.items():
+
+            if topic:
+
+                try:
+
+                    self._mqtt.message_callback_add(topic, self._receive_update)
+
+                    self._mqtt.subscribe(topic)
+
+                    _LOGGER.info("✅ Subscribed to %s: %s", topic_name, topic)
+
+                    subscribed_count += 1
+
+                except Exception as e:
+
+                    _LOGGER.error("❌ Failed to subscribe to %s (%s): %s", topic_name, topic, e)
+
+        
+
+        if subscribed_count == 0:
+
+            _LOGGER.warning("⚠️  No topics subscribed for %s - IR device may be send-only", self._name)
+
+    
+
+    def _receive_update(self, client, userdata, msg):
+
+        """Handle MQTT payloads via templates."""
+
         try:
-            payload = json.loads(msg.payload)
-            # match by numeric address if present in payload
-            addr = payload.get("address")
-            if str(addr) != str(self._address):
-                return
 
-            ir = payload.get("ir_ac") or {}
-            # update hvac mode mapping for fan -> fan_only
-            mode = ir.get("mode")
-            if mode:
-                if mode == "fan":
-                    self._hvac_mode = "fan_only"
+            payload_str = msg.payload.decode() if isinstance(msg.payload, bytes) else str(msg.payload)
+
+            _LOGGER.info("📥 [%s] Received on %s: %s", self._name, msg.topic, payload_str)
+
+            
+
+            try:
+
+                payload_json = json.loads(payload_str)
+
+            except:
+
+                payload_json = {}
+
+                _LOGGER.debug("Payload is not JSON, treating as plain text")
+
+            
+
+            # Check if message is for this device
+
+            if self._address and payload_json.get("address"):
+
+                if str(payload_json.get("address")) != str(self._address):
+
+                    _LOGGER.debug("Message for different address, ignoring")
+
+                    return
+
+            
+
+            updated = False
+
+            
+
+            # Mode state
+
+            if msg.topic == self._topic_mode_state:
+
+                if self._mode_state_template:
+
+                    val = _parse_template(self._mode_state_template, msg.payload)
+
+                    _LOGGER.info("   Mode parsed: %s", val)
+
+                    if val and val in HVAC_MAP:
+
+                        self._hvac_mode = HVAC_MAP[val]
+
+                        updated = True
+
                 else:
-                    self._hvac_mode = mode
 
-            # preset power (On/Off)
-            power = ir.get("power")
-            if power is not None:
-                self._preset_mode = "On" if power else "Off"
+                    # Try direct value
 
-            # temps
-            if "current_temperature" in ir:
+                    val = payload_json.get("mode") or payload_str
+
+                    if val in HVAC_MAP:
+
+                        self._hvac_mode = HVAC_MAP[val]
+
+                        updated = True
+
+            
+
+            # Target temperature
+
+            if msg.topic == self._topic_target_temp_state:
+
+                if self._target_temp_template:
+
+                    val = _parse_template(self._target_temp_template, msg.payload)
+
+                else:
+
+                    val = payload_json.get("temperature") or payload_str
+
+                
+
                 try:
-                    self._current_temp = float(ir.get("current_temperature"))
-                except Exception:
+
+                    self._target_temp = float(val)
+
+                    _LOGGER.info("   Target temp: %s°C", self._target_temp)
+
+                    updated = True
+
+                except:
+
                     pass
-            if "temperature" in ir:
+
+            
+
+            # Current temperature
+
+            if msg.topic == self._topic_curr_temp_state:
+
+                if self._current_temp_template:
+
+                    val = _parse_template(self._current_temp_template, msg.payload)
+
+                else:
+
+                    val = payload_json.get("current_temperature") or payload_str
+
+                
+
                 try:
-                    self._target_temp = float(ir.get("temperature"))
-                except Exception:
+
+                    self._current_temp = float(val)
+
+                    _LOGGER.info("   Current temp: %s°C", self._current_temp)
+
+                    updated = True
+
+                except:
+
                     pass
 
-            # fan speed mapping -> fan_mode string
-            fan_speed = ir.get("fan_speed")
-            if fan_speed is not None:
-                mapping = {1: "Vlow", 2: "Low", 3: "Med", 4: "High", 5: "Top", 6: "Auto"}
-                self._fan_mode = mapping.get(int(fan_speed), self._fan_modes[0])
+            
 
-            self._available = True
-            self.schedule_update_ha_state()
+            # Fan mode
+
+            if msg.topic == self._topic_fan_mode_state:
+
+                if self._fan_mode_state_template:
+
+                    val = _parse_template(self._fan_mode_state_template, msg.payload)
+
+                else:
+
+                    val = payload_json.get("fan_mode") or payload_str
+
+                
+
+                if val and val in self._fan_modes:
+
+                    self._fan_mode = val
+
+                    _LOGGER.info("   Fan mode: %s", self._fan_mode)
+
+                    updated = True
+
+            
+
+            # Preset mode
+
+            if msg.topic == self._topic_preset_state:
+
+                if self._preset_mode_state_template:
+
+                    val = _parse_template(self._preset_mode_state_template, msg.payload)
+
+                else:
+
+                    val = payload_json.get("preset") or payload_str
+
+                
+
+                if val and val in self._preset_modes:
+
+                    self._preset = val
+
+                    _LOGGER.info("   Preset: %s", self._preset)
+
+                    updated = True
+
+            
+
+            if updated or payload_json:
+
+                self._available = True
+
+                self.schedule_update_ha_state()
+
+                _LOGGER.info("✅ State updated for %s", self._name)
+
+            
 
         except Exception as e:
-            _LOGGER.exception("Error parsing IR AC state: %s", e)
-            self._available = False
-            self.schedule_update_ha_state()
 
-    # ------------------------
-    # DEVICE INFO
-    # ------------------------
-    @property
-    def device_info(self):
-        info = {
-            "identifiers": {(DOMAIN, self._unique_id)},
-            "name": self._name,
-            "manufacturer": self._manufacturer,
-            "model": self._model,
-        }
-        if self._area:
-            info["suggested_area"] = self._area
-        return info
+            _LOGGER.error("❌ Error processing message for %s: %s", self._name, e, exc_info=True)
 
-    # ------------------------
-    # PROPERTIES
-    # ------------------------
+    
+
     @property
+
     def name(self):
+
         return self._name
 
+    
+
     @property
+
     def unique_id(self):
+
         return self._unique_id
 
+    
+
     @property
+
+    def device_info(self):
+
+        info = {
+
+            "identifiers": {(DOMAIN, self._unique_id)},
+
+            "name": self.payload.get("device", {}).get("name", self._name),
+
+            "manufacturer": self._manufacturer,
+
+            "model": self._model,
+
+        }
+
+        if self._area:
+
+            info["suggested_area"] = self._area
+
+        return info
+
+    
+
+    @property
+
     def available(self):
+
         return self._available
 
+    
+
     @property
+
+    def temperature_unit(self):
+
+        return UnitOfTemperature.CELSIUS
+
+    
+
+    @property
+
     def hvac_modes(self):
+
         return self._hvac_modes
 
+    
+
     @property
+
     def hvac_mode(self):
+
         return self._hvac_mode
 
-    @property
-    def preset_modes(self):
-        return self._preset_modes
+    
 
     @property
-    def preset_mode(self):
-        return self._preset_mode or PRESET_NONE
 
-    @property
-    def current_temperature(self):
-        return self._current_temp
-
-    @property
-    def target_temperature(self):
-        return self._target_temp
-
-    @property
-    def min_temp(self):
-        return self._min_temp
-
-    @property
-    def max_temp(self):
-        return self._max_temp
-
-    @property
-    def temperature_step(self):
-        return self._temp_step
-
-    @property
     def fan_modes(self):
+
         return self._fan_modes
 
+    
+
     @property
+
     def fan_mode(self):
+
         return self._fan_mode
 
-    # ------------------------
-    # CONTROL METHODS
-    # ------------------------
-    def _publish(self, topic: str, payload_obj: dict):
-        try:
-            self._mqtt.publish(topic, json.dumps(payload_obj))
-        except Exception:
-            _LOGGER.exception("Failed to publish to %s", topic)
+    
 
-    async def async_set_hvac_mode(self, hvac_mode: str):
-        # mapping back 'fan_only' to 'fan' for the device
-        val = "fan" if hvac_mode == "fan_only" else hvac_mode
-        topic = self._device.get("mode_command_topic") or self._command_topic
-        payload = {"address": int(self._address), "type": "ir_ac", "action": "mode", "value": val, "version": "v1.0"}
-        self._publish(topic, payload)
+    @property
+
+    def preset_modes(self):
+
+        return self._preset_modes
+
+    
+
+    @property
+
+    def preset_mode(self):
+
+        return self._preset
+
+    
+
+    @property
+
+    def current_temperature(self):
+
+        return self._current_temp
+
+    
+
+    @property
+
+    def target_temperature(self):
+
+        return self._target_temp
+
+    
+
+    @property
+
+    def min_temp(self):
+
+        return self._min_temp
+
+    
+
+    @property
+
+    def max_temp(self):
+
+        return self._max_temp
+
+    
+
+    @property
+
+    def target_temperature_step(self):
+
+        return self._temp_step
+
+    
+
+    @property
+
+    def supported_features(self):
+
+        features = ClimateEntityFeature.TARGET_TEMPERATURE
+
+        
+
+        if self._fan_modes:
+
+            features |= ClimateEntityFeature.FAN_MODE
+
+        if self._preset_modes:
+
+            features |= ClimateEntityFeature.PRESET_MODE
+
+        
+
+        return features
+
+    
+
+    async def async_set_hvac_mode(self, hvac_mode: HVACMode):
+
+        """Set HVAC mode."""
+
+        _LOGGER.info("🎛️  [%s] Setting HVAC mode to: %s", self._name, hvac_mode)
+
+        
+
+        if not self._mode_command_template or not self._topic_mode_cmd:
+
+            _LOGGER.error("❌ No mode command template or topic configured")
+
+            return
+
+        
+
+        mode_str = REVERSE_HVAC.get(hvac_mode)
+
+        if not mode_str:
+
+            _LOGGER.error("❌ Unknown HVAC mode: %s", hvac_mode)
+
+            return
+
+        
+
+        try:
+
+            template = Template(self._mode_command_template)
+
+            payload = template.render(value=mode_str, mapping=REVERSE_HVAC)
+
+            
+
+            _LOGGER.info("📤 Publishing to %s: %s", self._topic_mode_cmd, payload)
+
+            self._mqtt.publish(self._topic_mode_cmd, payload)
+
+            
+
+            self._hvac_mode = hvac_mode
+
+            self.schedule_update_ha_state()
+
+            _LOGGER.info("✅ HVAC mode set successfully")
+
+        except Exception as e:
+
+            _LOGGER.error("❌ Failed to set HVAC mode: %s", e, exc_info=True)
+
+    
 
     async def async_set_temperature(self, **kwargs):
+
+        """Set target temperature."""
+
         temp = kwargs.get("temperature")
-        if temp is None:
+
+        _LOGGER.info("🌡️  [%s] Setting temperature to: %s°C", self._name, temp)
+
+        
+
+        if temp is None or not self._temp_command_template or not self._topic_temp_cmd:
+
+            _LOGGER.error("❌ Missing temperature or command config")
+
             return
-        topic = self._device.get("temperature_command_topic") or self._command_topic
-        payload = {"address": int(self._address), "type": "ir_ac", "action": "temperature", "value": int(temp), "version": "v1.0"}
-        self._publish(topic, payload)
+
+        
+
+        try:
+
+            temp = max(self._min_temp, min(self._max_temp, temp))
+
+            
+
+            template = Template(self._temp_command_template)
+
+            payload = template.render(value=int(temp))
+
+            
+
+            _LOGGER.info("📤 Publishing to %s: %s", self._topic_temp_cmd, payload)
+
+            self._mqtt.publish(self._topic_temp_cmd, payload)
+
+            
+
+            self._target_temp = temp
+
+            self.schedule_update_ha_state()
+
+            _LOGGER.info("✅ Temperature set successfully")
+
+        except Exception as e:
+
+            _LOGGER.error("❌ Failed to set temperature: %s", e, exc_info=True)
+
+    
 
     async def async_set_fan_mode(self, fan_mode: str):
-        mapping = {"Vlow": 1, "Low": 2, "Med": 3, "High": 4, "Top": 5, "Auto": 6}
-        val = mapping.get(fan_mode, 3)
-        topic = self._device.get("fan_mode_command_topic") or self._command_topic
-        payload = {"address": int(self._address), "type": "ir_ac", "action": "fan_speed", "value": int(val), "version": "v1.0"}
-        self._publish(topic, payload)
+
+        """Set fan mode."""
+
+        _LOGGER.info("💨 [%s] Setting fan mode to: %s", self._name, fan_mode)
+
+        
+
+        if not self._fan_mode_command_template or not self._topic_fan_mode_cmd:
+
+            _LOGGER.error("❌ No fan mode command config")
+
+            return
+
+        
+
+        if fan_mode not in self._fan_modes:
+
+            _LOGGER.error("❌ Invalid fan mode: %s", fan_mode)
+
+            return
+
+        
+
+        try:
+
+            fan_index = self._fan_modes.index(fan_mode) + 1
+
+            
+
+            template = Template(self._fan_mode_command_template)
+
+            payload = template.render(value=fan_mode, mapping={fm: i+1 for i, fm in enumerate(self._fan_modes)})
+
+            
+
+            _LOGGER.info("📤 Publishing to %s: %s", self._topic_fan_mode_cmd, payload)
+
+            self._mqtt.publish(self._topic_fan_mode_cmd, payload)
+
+            
+
+            self._fan_mode = fan_mode
+
+            self.schedule_update_ha_state()
+
+            _LOGGER.info("✅ Fan mode set successfully")
+
+        except Exception as e:
+
+            _LOGGER.error("❌ Failed to set fan mode: %s", e, exc_info=True)
+
+    
 
     async def async_set_preset_mode(self, preset_mode: str):
-        topic = self._device.get("preset_mode_command_topic") or self._command_topic
-        if preset_mode == "On":
-            payload = {"address": int(self._address), "type": "ir_ac", "action": "power", "value": True, "version": "v1.0"}
-        else:
-            payload = {"address": int(self._address), "type": "ir_ac", "action": "power", "value": False, "version": "v1.0"}
-        self._publish(topic, payload)
+
+        """Set preset mode."""
+
+        _LOGGER.info("🔘 [%s] Setting preset to: %s", self._name, preset_mode)
+
+        
+
+        if not self._preset_mode_command_template or not self._topic_preset_cmd:
+
+            _LOGGER.error("❌ No preset command config")
+
+            return
+
+        
+
+        if preset_mode not in self._preset_modes:
+
+            _LOGGER.error("❌ Invalid preset: %s", preset_mode)
+
+            return
+
+        
+
+        try:
+
+            template = Template(self._preset_mode_command_template)
+
+            payload = template.render(value=preset_mode)
+
+            
+
+            _LOGGER.info("📤 Publishing to %s: %s", self._topic_preset_cmd, payload)
+
+            self._mqtt.publish(self._topic_preset_cmd, payload)
+
+            
+
+            self._preset = preset_mode
+
+            self.schedule_update_ha_state()
+
+            _LOGGER.info("✅ Preset set successfully")
+
+        except Exception as e:
+
+            _LOGGER.error("❌ Failed to set preset: %s", e, exc_info=True)
+
+    
+
+    async def async_added_to_hass(self):
+
+        """Restore previous state when added to hass."""
+
+        await super().async_added_to_hass()
+
+        
+
+        old_state = await self.async_get_last_state()
+
+        if old_state is not None:
+
+            _LOGGER.info("🔄 Restoring previous state for %s", self._name)
+
+            
+
+            if old_state.state in [mode.value for mode in HVACMode]:
+
+                self._hvac_mode = HVACMode(old_state.state)
+
+            
+
+            if old_state.attributes.get("temperature"):
+
+                self._target_temp = float(old_state.attributes["temperature"])
+
+            
+
+            if old_state.attributes.get("fan_mode"):
+
+                self._fan_mode = old_state.attributes["fan_mode"]
+
+            
+
+            if old_state.attributes.get("preset_mode"):
+
+                self._preset = old_state.attributes["preset_mode"]
+
+            
+
+            _LOGGER.info("✅ Previous state restored")
+

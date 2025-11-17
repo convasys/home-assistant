@@ -1,97 +1,95 @@
-"""Lytiva Fan via MQTT discovery."""
+"""Lytiva fan integration with fully working ON/OFF buttons and slider."""
 from __future__ import annotations
 import json
 import logging
-from typing import Optional
+import math
+from typing import Any
 
-from homeassistant.components.fan import FanEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.components.fan import FanEntity, FanEntityFeature
 
 from . import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
-    """Set up Lytiva fan devices dynamically."""
     mqtt = hass.data[DOMAIN][entry.entry_id]["mqtt_client"]
     devices = hass.data[DOMAIN][entry.entry_id]["devices"]
 
     def add_new_fan(device):
-        entity = LytivaFan(device, mqtt)
-        async_add_entities([entity], True)
-        _LOGGER.info("Fan added dynamically: %s", device.get("name"))
+        ent = LytivaFan(device, mqtt)
+        async_add_entities([ent], True)
+        _LOGGER.info("✅ Lytiva fan added: %s (Address: %s)", device.get("name"), device.get("unique_id"))
 
-    register_cb = hass.data[DOMAIN][entry.entry_id]["register_fan_callback"]
-    register_cb(add_new_fan)
+    register = hass.data[DOMAIN][entry.entry_id].get("register_fan_callback")
+    if register:
+        register(add_new_fan)
 
     for dev in devices.values():
-        if dev.get("device_class") == "fan" or dev.get("device_class") == "fan":
+        if isinstance(dev, dict) and ("fan" in dev.get("name", "").lower() or dev.get("device_class") == "fan"):
             add_new_fan(dev)
 
 
 class LytivaFan(FanEntity):
-    """Representation of a Lytiva Fan."""
+    """Lytiva fan via MQTT with proper ON/OFF support."""
 
-    def __init__(self, device: dict, mqtt):
+    _attr_supported_features = (
+        FanEntityFeature.SET_SPEED
+        | FanEntityFeature.TURN_ON
+        | FanEntityFeature.TURN_OFF
+    )
+
+    def __init__(self, device: dict[str, Any], mqtt_client):
         self._device = device
-        self._mqtt = mqtt
+        self._mqtt = mqtt_client
 
         self._name = device.get("name")
         self._unique_id = str(device.get("unique_id") or device.get("address"))
-        self._address = device.get("unique_id") or device.get("address")
+        self._address = int(device.get("unique_id") or device.get("address"))
 
-        self._command_topic = device.get("command_topic")
         self._state_topic = device.get("state_topic")
+        self._command_topic = device.get("command_topic")
 
-        self._payload_on = device.get("payload_on")
-        self._payload_off = device.get("payload_off")
+        dev_meta = device.get("device", {})
+        self._manufacturer = dev_meta.get("manufacturer", "Lytiva")
+        self._model = dev_meta.get("model", "Fan")
+        self._area = dev_meta.get("suggested_area")
 
         self._available = True
-        self._percentage: Optional[int] = None
+        self._speed = 0
+        self._percentage = 0
+        self._last_speed = 3
+        self._is_on = False
 
-        # subscribe to state updates
-        if self._state_topic:
-            self._mqtt.message_callback_add(self._state_topic, self._on_state)
-            self._mqtt.subscribe(self._state_topic)
+        self._subscribe_state()
 
-    def _on_state(self, client, userdata, msg):
-        try:
-            payload = json.loads(msg.payload)
-            addr = payload.get("address")
-            if str(addr) != str(self._address):
-                return
+    def _subscribe_state(self):
+        if not self._state_topic:
+            return
 
-            fan = payload.get("fan") or {}
-            if "fan_speed" in fan:
-                # fan_speed 0..5 -> percentage 0..100 (discovery used *20)
-                try:
-                    speed = int(fan.get("fan_speed", 0))
-                    self._percentage = min(max(speed * 20, 0), 100)
-                except Exception:
-                    pass
-            self._available = True
-            self.schedule_update_ha_state()
-        except Exception:
-            _LOGGER.exception("Error parsing fan state")
-            self._available = False
-            self.schedule_update_ha_state()
+        def _cb(client, userdata, msg):
+            try:
+                payload = json.loads(msg.payload.decode())
+                if payload.get("address") != self._address:
+                    return
 
-    # ------------------------
-    # DEVICE INFO
-    # ------------------------
-    @property
-    def device_info(self):
-        info = {
-            "identifiers": {(DOMAIN, self._unique_id)},
-            "name": self._device.get("device", {}).get("name", self._name),
-            "manufacturer": self._device.get("device", {}).get("manufacturer", "Lytiva"),
-            "model": self._device.get("device", {}).get("model", "Fan"),
-        }
-        if self._device.get("device", {}).get("suggested_area"):
-            info["suggested_area"] = self._device.get("device", {}).get("suggested_area")
-        return info
+                speed = payload.get("fan", {}).get("fan_speed", payload.get("fan_speed"))
+                if speed is not None:
+                    speed = max(0, min(4, int(speed)))
+                    self._speed = speed
+                    self._percentage = speed * 25
+                    if speed > 0:
+                        self._last_speed = speed
+                    self._is_on = self._speed > 0
+                    self._available = True
+                    self.schedule_update_ha_state()
+            except Exception as e:
+                _LOGGER.error("Error processing fan state: %s", e)
+
+        self._mqtt.message_callback_add(self._state_topic, _cb)
+        self._mqtt.subscribe(self._state_topic)
+        _LOGGER.debug("Subscribed to fan state topic: %s", self._state_topic)
 
     @property
     def name(self):
@@ -102,45 +100,80 @@ class LytivaFan(FanEntity):
         return self._unique_id
 
     @property
+    def device_info(self):
+        info = {
+            "identifiers": {(DOMAIN, self._unique_id)},
+            "name": self._device.get("device", {}).get("name", self._name),
+            "manufacturer": self._manufacturer,
+            "model": self._model,
+        }
+        if self._area:
+            info["suggested_area"] = self._area
+        return info
+
+    @property
     def available(self):
         return self._available
+
+    @property
+    def is_on(self):
+        return self._is_on
 
     @property
     def percentage(self):
         return self._percentage
 
-    def _publish(self, payload_obj):
-        try:
-            # if payload_on/payload_off provided as JSON string, send that for on/off
-            if isinstance(payload_obj, str):
-                self._mqtt.publish(self._command_topic, payload_obj)
-            else:
-                self._mqtt.publish(self._command_topic, json.dumps(payload_obj))
-        except Exception:
-            _LOGGER.exception("Failed to publish fan command")
+    @property
+    def speed_count(self):
+        return 4
 
-    async def async_turn_on(self, percentage: int | None = None, **kwargs):
+    async def async_turn_on(self, percentage: int | None = None, preset_mode: str | None = None, **kwargs):
+        """Turn on fan using last speed or provided percentage."""
+        speed_to_use = self._last_speed if self._last_speed > 0 else 3
         if percentage is not None:
-            # convert percentage to fan_speed (0..5 -> 0..5 where 100 -> 5)
-            fan_speed = max(0, min(5, round(percentage / 20)))
-            payload = {"version": "v1.0", "type": "fan", "address": int(self._address), "fan_speed": int(fan_speed)}
-            self._publish(payload)
-        else:
-            if self._payload_on:
-                # payload_on is a JSON string in discovery, publish as is
-                self._publish(self._payload_on)
-            else:
-                payload = {"version": "v1.0", "type": "fan", "address": int(self._address), "fan_speed": 3}
-                self._publish(payload)
+            speed_to_use = max(1, math.ceil(percentage / 25))
+
+        payload = {
+            "version": "v1.0",
+            "type": "fan",
+            "address": self._address,
+            "fan_speed": speed_to_use
+        }
+        self._mqtt.publish(self._command_topic, json.dumps(payload))
+
+        self._speed = speed_to_use
+        self._percentage = self._speed * 25
+        self._last_speed = self._speed
+        self._is_on = True
+        self.schedule_update_ha_state()
 
     async def async_turn_off(self, **kwargs):
-        if self._payload_off:
-            self._publish(self._payload_off)
-        else:
-            payload = {"version": "v1.0", "type": "fan", "address": int(self._address), "fan_speed": 0}
-            self._publish(payload)
+        """Turn off fan via slider 0% hack."""
+        await self.async_set_percentage(0)
 
-    async def async_set_percentage(self, percentage: int):
-        fan_speed = max(0, min(5, round(percentage / 20)))
-        payload = {"version": "v1.0", "type": "fan", "address": int(self._address), "fan_speed": int(fan_speed)}
-        self._publish(payload)
+    async def async_set_percentage(self, percentage: int, **kwargs) -> None:
+        """Set fan speed; 0% turns it off."""
+        percentage = max(0, min(100, percentage))
+        speed = 0 if percentage == 0 else max(1, math.ceil(percentage / 25))
+
+        payload = {
+            "version": "v1.0",
+            "type": "fan",
+            "address": self._address,
+            "fan_speed": speed
+        }
+        self._mqtt.publish(self._command_topic, json.dumps(payload))
+
+        self._speed = speed
+        self._percentage = speed * 25
+        self._last_speed = speed if speed > 0 else self._last_speed
+        self._is_on = speed > 0
+        self.schedule_update_ha_state()
+
+    async def async_added_to_hass(self):
+        old_state = self.hass.states.get(f"fan.{self._unique_id}")
+        if old_state:
+            self._speed = math.ceil(int(old_state.attributes.get("percentage", 0)) / 25)
+            self._percentage = int(old_state.attributes.get("percentage", 0))
+            self._last_speed = self._speed if self._speed > 0 else 3
+            self._is_on = self._speed > 0

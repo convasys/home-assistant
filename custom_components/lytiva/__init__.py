@@ -51,6 +51,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "cover_callbacks": [],
         "climate_callbacks": [],
         "fan_callbacks": [],
+        "light_callbacks": [],
     }
 
     def register_cover_callback(callback):
@@ -59,13 +60,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.data[DOMAIN][entry.entry_id]["climate_callbacks"].append(callback)
     def register_fan_callback(callback):
         hass.data[DOMAIN][entry.entry_id]["fan_callbacks"].append(callback)
+    def register_light_callback(callback):
+        hass.data[DOMAIN][entry.entry_id]["light_callbacks"].append(callback)
 
     hass.data[DOMAIN][entry.entry_id]["register_cover_callback"] = register_cover_callback
     hass.data[DOMAIN][entry.entry_id]["register_climate_callback"] = register_climate_callback
     hass.data[DOMAIN][entry.entry_id]["register_fan_callback"] = register_fan_callback
+    hass.data[DOMAIN][entry.entry_id]["register_light_callback"] = register_light_callback
 
-    # ========== MQTT CALLBACKS ==========
-
+    # MQTT callbacks
     def on_connect(client, userdata, flags, reason_code, *args):
         if reason_code == 0:
             _LOGGER.info("Connected to MQTT %s:%s", broker, port)
@@ -75,7 +78,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _LOGGER.error("MQTT connection failed: %s", reason_code)
 
     def on_message(client, userdata, msg):
-        """Process MQTT discovery messages."""
         try:
             payload = json.loads(msg.payload)
         except Exception:
@@ -93,20 +95,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         devices = hass.data[DOMAIN][entry.entry_id]["devices"]
         first_time = device_id not in devices
-
         devices[device_id] = payload
 
-        # Dynamic add for cover / climate / fan
-        if first_time:
-            if platform == "cover":
-                for cb in hass.data[DOMAIN][entry.entry_id]["cover_callbacks"]:
-                    hass.loop.call_soon_threadsafe(cb, payload)
-            elif platform == "climate":
-                for cb in hass.data[DOMAIN][entry.entry_id]["climate_callbacks"]:
-                    hass.loop.call_soon_threadsafe(cb, payload)
-            elif platform == "fan":
-                for cb in hass.data[DOMAIN][entry.entry_id]["fan_callbacks"]:
-                    hass.loop.call_soon_threadsafe(cb, payload)
+        # Call callbacks safely
+        if platform == "cover":
+            for cb in list(hass.data[DOMAIN][entry.entry_id]["cover_callbacks"]):
+                hass.loop.call_soon_threadsafe(cb, payload)
+        elif platform == "climate":
+            for cb in list(hass.data[DOMAIN][entry.entry_id]["climate_callbacks"]):
+                hass.loop.call_soon_threadsafe(cb, payload)
+        elif platform == "fan":
+            for cb in list(hass.data[DOMAIN][entry.entry_id]["fan_callbacks"]):
+                hass.loop.call_soon_threadsafe(cb, payload)
+        elif platform == "light":
+            for cb in list(hass.data[DOMAIN][entry.entry_id]["light_callbacks"]):
+                hass.loop.call_soon_threadsafe(cb, payload)
 
     mqtt.on_connect = on_connect
     mqtt.on_message = on_message
@@ -119,12 +122,33 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.error("Could not connect to MQTT: %s", e)
         return False
 
+    # Forward platforms
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # Force-add any devices already discovered
+    devices = hass.data[DOMAIN][entry.entry_id]["devices"]
+    for payload in list(devices.values()):
+        if isinstance(payload, dict):
+            # Cover
+            if "cover" in payload.get("device_class", "").lower():
+                for cb in hass.data[DOMAIN][entry.entry_id]["cover_callbacks"]:
+                    hass.loop.call_soon_threadsafe(cb, payload)
+            # Climate
+            if "mode_state_topic" in payload:
+                for cb in hass.data[DOMAIN][entry.entry_id]["climate_callbacks"]:
+                    hass.loop.call_soon_threadsafe(cb, payload)
+            # Fan
+            if "fan_modes" in payload:
+                for cb in hass.data[DOMAIN][entry.entry_id]["fan_callbacks"]:
+                    hass.loop.call_soon_threadsafe(cb, payload)
+            # Light
+            if "state_topic" in payload and "brightness" in payload.get("supported_features",""):
+                for cb in hass.data[DOMAIN][entry.entry_id]["light_callbacks"]:
+                    hass.loop.call_soon_threadsafe(cb, payload)
+
     return True
 
-
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload Lytiva and disconnect MQTT."""
     unload = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
     if unload:
