@@ -1,7 +1,7 @@
 {
   "domain": "lytiva",
   "name": "Lytiva",
-  "version": "1.0.4",
+  "version": "1.1.0",
   "documentation": "https://github.com/convasys/home-assistant",
   "issue_tracker": "https://github.com/convasys/home-assistant/issues",
   "requirements": ["paho-mqtt==2.1.0"],
@@ -9,5 +9,6 @@
   "codeowners": ["@convasys"],
   "integration_type": "hub",
   "iot_class": "local_push",
-  "config_flow": true
+  "config_flow": true,
+  "loggers": ["lytiva"]
 }
