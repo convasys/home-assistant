@@ -1,7 +1,5 @@
 {
-  "name": "Lytiva Integration",
+  "name": "Lytiva",
   "content_in_root": false,
-  "render_readme": true,
-  "zip_release": false,
-  "filename": "lytiva.zip"
+  "render_readme": true
 }
