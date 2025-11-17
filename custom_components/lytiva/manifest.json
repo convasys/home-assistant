@@ -1,7 +1,7 @@
 {
   "domain": "lytiva",
   "name": "Lytiva",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "documentation": "https://github.com/convasys/home-assistant",
   "issue_tracker": "https://github.com/convasys/home-assistant/issues",
   "requirements": ["paho-mqtt==2.1.0"],
