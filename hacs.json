@@ -1,8 +1,6 @@
 {
   "name": "Lytiva",
-  "content_in_root": false,
-  "render_readme": true,
+  "domains": ["lytiva"],
   "homeassistant": "2024.1.0",
-  "filename": "lytiva.zip",
-  "zip_release": true
+  "render_readme": true
 }
