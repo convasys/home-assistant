@@ -1,0 +1,12 @@
+{
+  "domain": "lytiva",
+  "name": "Lytiva",
+  "version": "1.0.0",
+  "documentation": "https://github.com/convasys/home-assistant",
+  "issue_tracker": "https://github.com/convasys/home-assistant/issues",
+  "requirements": [],
+  "dependencies": [],
+  "codeowners": ["@convasys"],
+  "iot_class": "local_push",
+  "config_flow": true
+}

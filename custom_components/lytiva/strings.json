@@ -1,0 +1,25 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up Lytiva",
+        "description": "Configure Lytiva MQTT connection",
+        "data": {
+          "broker": "MQTT Broker IP",
+          "port": "Port",
+          "username": "Username (optional)",
+          "password": "Password (optional)",
+          "discovery_prefix": "Discovery Prefix"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to MQTT broker. Check IP address and port.",
+      "invalid_auth": "Invalid username or password.",
+      "unknown": "Unexpected error occurred."
+    },
+    "abort": {
+      "already_configured": "Lytiva is already configured."
+    }
+  }
+}
