@@ -1,138 +1,163 @@
-"""Lytiva curtain (cover) via MQTT - optimized for multiple entities on shared topics."""
+"""Lytiva curtain (cover) via MQTT - mirror of light.py style (discovery, address/uid handling,
+device_info with suggested_area, duplicate protection, centralized MQTT publish & status updates).
+"""
 from __future__ import annotations
 import logging
 import json
-from homeassistant.components.cover import CoverEntity
+from typing import Any, Dict, Optional
+
+from homeassistant.components.cover import CoverEntity, CoverEntityFeature
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+
 from . import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-SUPPORT_OPEN = 1
-SUPPORT_CLOSE = 2
-SUPPORT_STOP = 4
-SUPPORT_SET_POSITION = 8
 
-
+# -----------------------------
+#  PLATFORM SETUP (Discovery)
+# -----------------------------
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
-    """Set up curtains dynamically with centralized MQTT handling."""
-    mqtt = hass.data[DOMAIN][entry.entry_id]["mqtt_client"]
-    devices = hass.data[DOMAIN][entry.entry_id]["devices"]
+    data = hass.data[DOMAIN][entry.entry_id]
+    register_cb = data.get("register_cover_callback")
 
-    # Dictionary to store entities by their address for quick lookup
-    covers_by_address = {}
-    hass.data[DOMAIN][entry.entry_id]["covers_by_address"] = covers_by_address
-
-    def add_new_cover(device):
-        entity = LytivaCurtain(device, mqtt, hass, entry)
-        async_add_entities([entity], True)
-        covers_by_address[entity._address] = entity
-        _LOGGER.debug(
-            "add_new_cover called for device: %s (address=%s)", device.get("name"), device.get("address")
-        )
-
-    # register callback for dynamic discovery if available
-    register_cb = hass.data[DOMAIN][entry.entry_id].get("register_cover_callback")
     if register_cb:
-        register_cb(add_new_cover)
-        _LOGGER.debug("Registered cover callback for dynamic discovery")
+        register_cb(lambda payload: _handle_discovery(hass, entry, payload, async_add_entities))
+        _LOGGER.debug("Lytiva Cover: discovery callback registered.")
+    else:
+        _LOGGER.warning("Lytiva Cover: register_cover_callback NOT found.")
 
-    # Add already discovered curtains
-    for dev in devices.values():
-        if dev.get("device_class") == "curtain" or dev.get("platform") == "cover":
-            _LOGGER.debug("Adding existing discovered curtain: %s (address=%s)", dev.get("name"), dev.get("address"))
-            add_new_cover(dev)
 
-    # Central MQTT subscription for NODE and GROUP topics
-    def on_mqtt_message(client, userdata, msg):
-        try:
-            payload = json.loads(msg.payload)
-            addr = payload.get("address")
-            if addr is None:
-                return
-            entity = covers_by_address.get(addr)
-            if entity:
-                level = payload.get("curtain", {}).get("curtain_level", payload.get("curtain_level"))
-                if level is not None:
-                    new_pos = int(level)
-                    if new_pos != entity._position:
-                        entity._position = new_pos
-                        _LOGGER.info("Curtain %s updated position: %s", entity._name, entity._position)
-                        try:
-                            entity.schedule_update_ha_state()
-                        except Exception:
-                            try:
-                                entity.async_write_ha_state()
-                            except Exception:
-                                pass
-        except Exception as e:
-            _LOGGER.exception("Error handling curtain STATUS message: %s", e)
-
+# -----------------------------
+#  DISCOVERY HANDLER
+# -----------------------------
+def _handle_discovery(hass: HomeAssistant, entry: ConfigEntry, payload: Dict[str, Any], async_add_entities):
     try:
-        mqtt.subscribe("LYT/+/NODE/E/STATUS")
-        mqtt.message_callback_add("LYT/+/NODE/E/STATUS", on_mqtt_message)
-        mqtt.subscribe("LYT/+/GROUP/E/STATUS")
-        mqtt.message_callback_add("LYT/+/GROUP/E/STATUS", on_mqtt_message)
-        _LOGGER.debug("Central MQTT subscription added for curtain STATUS topics")
+        uid = payload.get("unique_id") or payload.get("address")
+        if uid is None:
+            _LOGGER.debug("Lytiva Cover discovery payload missing unique id/address: %s", payload)
+            return
+
+        uid = str(uid)
+
+        # If discovery payload didn't include address, use unique_id as address (fallback)
+        if "address" not in payload or payload.get("address") in (None, ""):
+            payload["address"] = uid
+
+        store = hass.data[DOMAIN][entry.entry_id]
+        by_uid: Dict[str, Any] = store["entities_by_unique_id"]
+        by_addr: Dict[str, Any] = store["entities_by_address"]
+
+        # If already present by unique id -> update config (avoid duplicates)
+        if uid in by_uid:
+            ent = by_uid[uid]
+            try:
+                ent._cfg = payload
+            except Exception:
+                pass
+            _LOGGER.debug("Lytiva Cover discovery: existing entity updated uid=%s", uid)
+            return
+
+        # If address already present -> avoid creating duplicates
+        addr_str = str(payload.get("address"))
+        if addr_str in by_addr:
+            ent = by_addr[addr_str]
+            try:
+                # Map the uid -> existing entity so future lookups by unique_id work
+                by_uid[uid] = ent
+                ent._cfg = payload
+            except Exception:
+                pass
+            _LOGGER.debug("Lytiva Cover discovery: existing entity found by address=%s", addr_str)
+            return
+
+        # create new entity
+        ent = LytivaCurtain(hass, entry, payload)
+        by_uid[uid] = ent
+        by_addr[str(ent.address)] = ent
+
+        hass.add_job(async_add_entities, [ent])
+        _LOGGER.info("Lytiva Cover added: %s (uid=%s address=%s)", ent.name, uid, ent.address)
+
     except Exception as e:
-        _LOGGER.error("Failed to subscribe curtain MQTT topics: %s", e)
+        _LOGGER.exception("Lytiva Cover discovery error: %s", e)
 
 
+# -----------------------------
+#  COVER ENTITY
+# -----------------------------
 class LytivaCurtain(CoverEntity):
-    """Representation of a Lytiva Curtain."""
+    """Representation of a Lytiva Curtain device."""
 
-    def __init__(self, device, mqtt, hass, entry):
-        self._device = device or {}
-        self._mqtt = mqtt
-        self._hass = hass
+    _attr_supported_features = (
+        CoverEntityFeature.OPEN
+        | CoverEntityFeature.CLOSE
+        | CoverEntityFeature.STOP
+        | CoverEntityFeature.SET_POSITION
+    )
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, cfg: Dict[str, Any]) -> None:
+        self.hass = hass
         self._entry = entry
+        self._cfg: Dict[str, Any] = cfg or {}
 
-        self._name = self._device.get("name", "Lytiva Curtain")
-        self._unique_id = str(self._device.get("unique_id") or self._device.get("address"))
-        self._address = self._device.get("address")
+        # identity
+        self._attr_name = self._cfg.get("name", "Lytiva Curtain")
+        self._attr_unique_id = str(self._cfg.get("unique_id") or self._cfg.get("address"))
 
-        self._command_topic = self._device.get("command_topic")
-        self._state_topic = self._device.get("state_topic")
-        self._position_topic = self._device.get("position_topic") or self._state_topic
-        self._set_position_topic = self._device.get("set_position_topic") or self._command_topic
-        self._set_position_template = self._device.get("set_position_template")
+        # address (prefer int if it's integer-like)
+        addr = self._cfg.get("address")
+        try:
+            # some discovery send numeric addresses; enforce int when possible
+            self.address = int(addr)
+        except Exception:
+            self.address = str(addr)
 
-        self._payload_open = self._device.get("payload_open")
-        self._payload_close = self._device.get("payload_close")
-        self._payload_stop = self._device.get("payload_stop")
+        # topics / payloads from discovery
+        self._command_topic: Optional[str] = self._cfg.get("command_topic")
+        self._state_topic: Optional[str] = self._cfg.get("state_topic")
+        self._position_topic: Optional[str] = self._cfg.get("position_topic") or self._state_topic
+        self._set_position_template: Optional[str] = self._cfg.get("set_position_template")
+        self._payload_open: Optional[Any] = self._cfg.get("payload_open")
+        self._payload_close: Optional[Any] = self._cfg.get("payload_close")
+        self._payload_stop: Optional[Any] = self._cfg.get("payload_stop")
 
-        self._position = None
+        # runtime state
+        self._position: Optional[int] = None
         self._attr_available = True
 
-        dev_meta = self._device.get("device", {})
-        self._manufacturer = dev_meta.get("manufacturer") or self._device.get("manufacturer") or "Lytiva"
-        self._model = dev_meta.get("model") or self._device.get("model") or "Curtain"
-        self._sw_version = dev_meta.get("sw_version") or self._device.get("sw_version")
-        self._hw_version = dev_meta.get("hw_version") or self._device.get("hw_version")
-        self._area = dev_meta.get("suggested_area") or self._device.get("suggested_area")
+        # device metadata
+        dev_meta = self._cfg.get("device", {}) or {}
+        self._manufacturer = dev_meta.get("manufacturer", "Lytiva")
+        self._model = dev_meta.get("model", "Curtain")
+        self._area = dev_meta.get("suggested_area")
+        self._sw_version = dev_meta.get("sw_version")
+        self._hw_version = dev_meta.get("hw_version")
 
         _LOGGER.debug(
-            "Initialized LytivaCurtain name=%s unique_id=%s address=%s state_topic=%s position_topic=%s",
-            self._name, self._unique_id, self._address, self._state_topic, self._position_topic
+            "Initialized LytivaCurtain name=%s uid=%s address=%s state_topic=%s set_position_template=%s",
+            self._attr_name, self._attr_unique_id, self.address, self._state_topic, bool(self._set_position_template),
         )
 
+    # -----------------------------
+    #  DEVICE INFO (area + identifiers)
+    # -----------------------------
     @property
     def device_info(self):
-        identifiers = None
-        dev_block = self._device.get("device", {})
-        if dev_block and dev_block.get("identifiers"):
-            ids = dev_block.get("identifiers")
-            if isinstance(ids, (list, tuple)) and ids:
-                identifiers = {(DOMAIN, ids[0])}
-        if not identifiers:
-            identifiers = {(DOMAIN, self._unique_id)}
+        dev = self._cfg.get("device", {}) or {}
+
+        identifiers = dev.get("identifiers")
+        if isinstance(identifiers, (list, tuple)) and identifiers:
+            identifiers = {(DOMAIN, identifiers[0])}
+        else:
+            identifiers = {(DOMAIN, self._attr_unique_id)}
 
         info = {
             "identifiers": identifiers,
-            "name": dev_block.get("name") or self._name,
-            "manufacturer": self._manufacturer,
-            "model": self._model,
+            "name": dev.get("name", self._attr_name),
+            "manufacturer": dev.get("manufacturer", self._manufacturer),
+            "model": dev.get("model", self._model),
         }
         if self._sw_version:
             info["sw_version"] = self._sw_version
@@ -142,51 +167,160 @@ class LytivaCurtain(CoverEntity):
             info["suggested_area"] = self._area
         return info
 
+    # -----------------------------
+    #  BASIC PROPS
+    # -----------------------------
     @property
-    def name(self):
-        return self._name
+    def name(self) -> str:
+        return self._attr_name
 
     @property
-    def unique_id(self):
-        return self._unique_id
+    def unique_id(self) -> str:
+        return self._attr_unique_id
 
     @property
-    def supported_features(self):
-        return SUPPORT_OPEN | SUPPORT_CLOSE | SUPPORT_STOP | SUPPORT_SET_POSITION
-
-    @property
-    def current_cover_position(self):
+    def current_cover_position(self) -> Optional[int]:
         return self._position
 
     @property
-    def is_closed(self):
-        if self._position is not None:
-            return self._position == 0
-        return None
+    def is_closed(self) -> Optional[bool]:
+        if self._position is None:
+            return None
+        return self._position == 0
 
+    # -----------------------------
+    #  MQTT PUBLISH HELPER
+    # -----------------------------
+    def _publish_payload(self, payload: Dict[str, Any]) -> None:
+        try:
+            # ensure address present in payload (device expects it)
+            if self.address is not None:
+                try:
+                    payload["address"] = int(self.address)
+                except Exception:
+                    payload["address"] = self.address
+            mqtt = self.hass.data[DOMAIN][self._entry.entry_id]["mqtt_client"]
+            topic = self._command_topic or f"LYT/{self.address}/CMD"
+            mqtt.publish(topic, json.dumps(payload))
+        except Exception as e:
+            _LOGGER.exception("Lytiva Cover publish failed for %s: %s", self._attr_name, e)
+
+    # -----------------------------
+    #  COMMANDS (open/close/stop/set_position)
+    # -----------------------------
     def open_cover(self, **_):
-        if self._payload_open and self._command_topic:
-            self._mqtt.publish(self._command_topic, self._payload_open)
-            _LOGGER.debug("Published open payload for %s to %s", self._name, self._command_topic)
+        try:
+            if self._payload_open and self._command_topic:
+                # payload already a JSON string or dict in discovery; normalize to dict
+                payload = _ensure_dict(self._payload_open)
+                self._publish_payload(payload)
+                _LOGGER.debug("Published open for %s -> %s", self._attr_name, self._command_topic)
+        except Exception as e:
+            _LOGGER.exception("open_cover error for %s: %s", self._attr_name, e)
 
     def close_cover(self, **_):
-        if self._payload_close and self._command_topic:
-            self._mqtt.publish(self._command_topic, self._payload_close)
-            _LOGGER.debug("Published close payload for %s to %s", self._name, self._command_topic)
+        try:
+            if self._payload_close and self._command_topic:
+                payload = _ensure_dict(self._payload_close)
+                self._publish_payload(payload)
+                _LOGGER.debug("Published close for %s -> %s", self._attr_name, self._command_topic)
+        except Exception as e:
+            _LOGGER.exception("close_cover error for %s: %s", self._attr_name, e)
 
     def stop_cover(self, **_):
-        if self._payload_stop and self._command_topic:
-            self._mqtt.publish(self._command_topic, self._payload_stop)
-            _LOGGER.debug("Published stop payload for %s to %s", self._name, self._command_topic)
+        try:
+            if self._payload_stop and self._command_topic:
+                payload = _ensure_dict(self._payload_stop)
+                self._publish_payload(payload)
+                _LOGGER.debug("Published stop for %s -> %s", self._attr_name, self._command_topic)
+        except Exception as e:
+            _LOGGER.exception("stop_cover error for %s: %s", self._attr_name, e)
 
     def set_cover_position(self, **kwargs):
-        pos = kwargs.get("position")
-        if pos is not None and self._set_position_topic:
+        try:
+            pos = kwargs.get("position")
+            if pos is None:
+                return
+
+            # if discovery provided a template, use it (expects "{{ position }}")
+            template = self._set_position_template or self._cfg.get("set_position_template") or ""
+            if template:
+                try:
+                    # replace placeholder with an integer position
+                    payload_text = template.replace("{{ position }}", str(int(pos)))
+                    # try parse dict, otherwise send raw text
+                    try:
+                        payload = json.loads(payload_text)
+                        self._publish_payload(payload)
+                    except Exception:
+                        mqtt = self.hass.data[DOMAIN][self._entry.entry_id]["mqtt_client"]
+                        topic = self._command_topic or f"LYT/{self.address}/CMD"
+                        mqtt.publish(topic, payload_text)
+                    _LOGGER.debug("Published set_position for %s -> %s", self._attr_name, payload_text)
+                    return
+                except Exception:
+                    _LOGGER.exception("Error applying set_position_template for %s", self._attr_name)
+
+            # fallback: build a simple curtain payload with curtain_level
+            payload = {"version": "v1.0", "type": "curtain", "address": self.address, "curtain_level": int(pos)}
+            self._publish_payload(payload)
+            _LOGGER.debug("Published fallback set_position for %s -> %s", self._attr_name, payload)
+        except Exception as e:
+            _LOGGER.exception("set_cover_position error for %s: %s", self._attr_name, e)
+
+    # -----------------------------
+    #  CENTRAL STATUS UPDATE (called from __init__.py handler)
+    # -----------------------------
+    async def _update_from_payload(self, payload: Dict[str, Any]) -> None:
+        try:
+            # match by address (address may be int or string)
+            inc = payload.get("address") or payload.get("unique_id")
+            if inc is None:
+                return
             try:
-                payload = (self._set_position_template or self._device.get("set_position_template") or "").replace(
-                    "{{ position }}", str(pos)
-                )
-                self._mqtt.publish(self._set_position_topic, payload)
-                _LOGGER.debug("Published set_position for %s to %s: %s", self._name, self._set_position_topic, payload)
-            except Exception as e:
-                _LOGGER.error("Error publishing set_position for %s: %s", self._name, e)
+                if str(inc) != str(self.address):
+                    return
+            except Exception:
+                return
+
+            # look for nested curtain.curtain_level or top-level curtain_level/position/level
+            level = None
+            if isinstance(payload.get("curtain"), dict):
+                level = payload["curtain"].get("curtain_level")
+            if level is None:
+                level = payload.get("curtain_level") or payload.get("position") or payload.get("level")
+
+            if level is not None:
+                try:
+                    new_pos = int(level)
+                except Exception:
+                    return
+                if new_pos != self._position:
+                    self._position = new_pos
+                    _LOGGER.debug("Curtain %s updated position -> %s", self._attr_name, self._position)
+                    try:
+                        self.async_write_ha_state()
+                    except Exception:
+                        # fallback scheduling
+                        try:
+                            self.schedule_update_ha_state()
+                        except Exception:
+                            pass
+        except Exception as e:
+            _LOGGER.exception("Lytiva Cover update error for %s: %s", self._attr_name, e)
+
+
+# -----------------------------
+#  HELPERS
+# -----------------------------
+def _ensure_dict(val: Any) -> Dict[str, Any]:
+    """Normalize payload that may be a JSON string or dict into a dict."""
+    if isinstance(val, dict):
+        return val
+    try:
+        if isinstance(val, str):
+            return json.loads(val)
+    except Exception:
+        pass
+    # last resort: return a dict-wrapped message
+    return {"payload": val}

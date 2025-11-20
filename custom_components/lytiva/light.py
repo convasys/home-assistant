@@ -1,8 +1,8 @@
-"""Lytiva lights via MQTT with real-time updates (handles device + group status)."""
+"""Lytiva lights via MQTT (stable + HA compatible + area support)."""
 from __future__ import annotations
 import logging
 import json
-import asyncio
+from typing import Any, Dict
 
 from homeassistant.components.light import (
     LightEntity,
@@ -13,337 +13,247 @@ from homeassistant.components.light import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+
+from . import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
-DOMAIN = "lytiva"
 
 
-async def async_setup_entry(
-    hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
-) -> None:
-    entry_data = hass.data[DOMAIN][config_entry.entry_id]
-    mqtt = entry_data["mqtt_client"]
-    discovery_prefix = entry_data.get("discovery_prefix", "homeassistant")
-    devices = entry_data["devices"]
+# ---------------------------------------------------------
+#  REGISTER DISCOVERY CALLBACK
+# ---------------------------------------------------------
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
+    data = hass.data[DOMAIN][entry.entry_id]
+    register_cb = data.get("register_light_callback")
 
-    #
-    # -------- REAL-TIME STATUS HANDLER (NODE + GROUP) --------
-    #
-    async def handle_state_message(message):
-        try:
-            raw = message.payload
-            if isinstance(raw, (bytes, bytearray)):
-                text = raw.decode(errors="ignore")
-            else:
-                text = str(raw)
+    if register_cb:
+        register_cb(lambda payload: _handle_discovery(hass, entry, payload, async_add_entities))
+        _LOGGER.debug("Lytiva Light: discovery callback registered.")
 
-            payload = json.loads(text)
 
-            # Address from payload MUST be present
-            address = payload.get("address")
-            if address is None:
-                return
-
-            # normalize address to int when possible
-            try:
-                address_int = int(address)
-            except Exception:
-                address_int = None
-
-            # Try to update any entity in devices that matches the address
-            for obj in list(devices.values()):
-                # Only update if object looks like an entity (has address and update method)
-                if not hasattr(obj, "address") or not hasattr(obj, "_update_from_payload"):
-                    continue
-
-                try:
-                    # compare both int and str
-                    if address_int is not None and isinstance(obj.address, int) and obj.address == address_int:
-                        await obj._update_from_payload(payload)
-                    elif str(obj.address) == str(address):
-                        await obj._update_from_payload(payload)
-                except Exception as e:
-                    _LOGGER.exception("Error updating entity from payload: %s", e)
-
-        except json.JSONDecodeError:
-            _LOGGER.error("Received invalid JSON on state topic: %s", message.topic)
-        except Exception as e:
-            _LOGGER.exception("Error processing STATUS message: %s", e)
-
-    def on_state(client, userdata, message):
-        # run coroutine safely on hass loop
-        try:
-            asyncio.run_coroutine_threadsafe(handle_state_message(message), hass.loop)
-        except Exception as e:
-            _LOGGER.exception("Failed to schedule state handler: %s", e)
-
-    # Subscribe to both per-device NODE status and group status topics.
-    # These topics use single-level wildcard for project_uuid.
+# ---------------------------------------------------------
+#  DISCOVERY HANDLER
+# ---------------------------------------------------------
+def _handle_discovery(hass, entry, payload, async_add_entities):
     try:
-        mqtt.message_callback_add("LYT/+/NODE/E/STATUS", on_state)
-        mqtt.subscribe("LYT/+/NODE/E/STATUS")
+        uid = payload.get("unique_id") or payload.get("address")
+        if uid is None:
+            return
+
+        uid = str(uid)
+
+        # FIX: If address missing, use unique_id as address
+        if "address" not in payload or payload.get("address") is None:
+            payload["address"] = uid
+
+        store = hass.data[DOMAIN][entry.entry_id]
+        by_uid = store["entities_by_unique_id"]
+        by_addr = store["entities_by_address"]
+
+        # Duplicate check
+        if uid in by_uid:
+            return
+
+        if str(payload["address"]) in by_addr:
+            return
+
+        ent = LytivaLight(hass, entry, payload)
+        by_uid[uid] = ent
+        by_addr[str(ent.address)] = ent
+
+        hass.add_job(async_add_entities, [ent])
+
     except Exception as e:
-        _LOGGER.debug("Could not subscribe NODE status topic: %s", e)
-
-    try:
-        mqtt.message_callback_add("LYT/+/GROUP/E/STATUS", on_state)
-        mqtt.subscribe("LYT/+/GROUP/E/STATUS")
-    except Exception as e:
-        _LOGGER.debug("Could not subscribe GROUP status topic: %s", e)
-
-    #
-    # -------- AUTO DISCOVERY HANDLER --------
-    #
-    def on_light_discovery(client, userdata, message):
-        try:
-            payload = json.loads(message.payload.decode())
-            unique_id = payload.get("unique_id")
-            if unique_id is None:
-                return
-
-            unique_id = str(unique_id)
-
-            # If we already created an entity for this unique_id, skip
-            if unique_id in devices:
-                return
-
-            light = LytivaLight(hass, payload, mqtt)
-            # store entity object by unique_id (this will be iterated by status handler)
-            devices[unique_id] = light
-            hass.add_job(async_add_entities, [light])
-
-        except Exception as e:
-            _LOGGER.exception("Error discovering light: %s", e)
-
-    # Add callback for discovery (discovery_prefix/light/+/config)
-    try:
-        mqtt.message_callback_add(f"{discovery_prefix}/light/+/config", on_light_discovery)
-    except Exception as e:
-        _LOGGER.debug("Could not add discovery callback: %s", e)
+        _LOGGER.exception("Lytiva Light discovery failed: %s", e)
 
 
-#
-# -------- LIGHT ENTITY CLASS --------
-#
+# ---------------------------------------------------------
+#  LIGHT ENTITY
+# ---------------------------------------------------------
 class LytivaLight(LightEntity):
-    def __init__(self, hass: HomeAssistant, config: dict, mqtt) -> None:
+    """Representation of a Lytiva Light."""
+
+    def __init__(self, hass, entry, cfg):
         self.hass = hass
-        self._mqtt = mqtt
-        self._config = config
+        self._entry = entry
+        self._cfg = cfg or {}
 
-        # Basic fields
-        self._attr_name = config.get("name", "Lytiva Light")
-        # Use discovery unique_id exactly to avoid duplicates
-        self._attr_unique_id = str(config.get("unique_id"))
+        # Identity
+        self._attr_name = cfg.get("name", "Lytiva Light")
+        self._attr_unique_id = str(cfg.get("unique_id") or cfg.get("address"))
 
-        # Address MUST always be int if possible
-        addr = config.get("address") or config.get("unique_id")
+        # FIX: If address missing — use unique_id as address
+        addr = cfg.get("address") if cfg.get("address") not in (None, "") else self._attr_unique_id
+
         try:
             self.address = int(addr)
-        except Exception:
-            self.address = str(addr)
+        except:
+            self.address = addr
 
-        self.command_topic = config.get("command_topic")
+        self.command_topic = cfg.get("command_topic")
 
-        # Default state
+        # Default internal state
         self._attr_is_on = False
         self._attr_brightness = 255
-
-        # Color temp: keep your existing mireds mapping but expose kelvin in HA if needed
-        self._attr_min_mireds = config.get("min_mireds", 154)
-        self._attr_max_mireds = config.get("max_mireds", 370)
-
-        # Convert mired defaults to kelvin for HA compatibility (safe fallback)
-        try:
-            self._attr_min_color_temp_kelvin = int(round(1_000_000 / int(self._attr_max_mireds)))
-            self._attr_max_color_temp_kelvin = int(round(1_000_000 / int(self._attr_min_mireds)))
-        except Exception:
-            self._attr_min_color_temp_kelvin = 2700
-            self._attr_max_color_temp_kelvin = 6500
-
-        # keep a color_temp attribute in mireds (for your templates) — default to min_mireds
-        self._attr_color_temp = self._attr_min_mireds
-
         self._attr_rgb_color = [255, 255, 255]
 
-        # Device Info
-        dev = config.get("device", {})
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, self._attr_unique_id)},
+        # CCT temperature
+        self._attr_min_mireds = cfg.get("min_mireds", 154)
+        self._attr_max_mireds = cfg.get("max_mireds", 370)
+        self._attr_color_temp = self._attr_min_mireds
+
+        # Type detect
+        typ = cfg.get("type", "")
+
+        if "color_temp_command_topic" in cfg or typ == "cct":
+            self.light_type = "cct"
+        elif "rgb_command_topic" in cfg or typ == "rgb":
+            self.light_type = "rgb"
+        else:
+            self.light_type = "dimmer"
+
+        # Supported modes
+        if self.light_type == "cct":
+            self._attr_supported_color_modes = {ColorMode.COLOR_TEMP, ColorMode.BRIGHTNESS}
+            self._attr_color_mode = ColorMode.COLOR_TEMP
+        elif self.light_type == "rgb":
+            self._attr_supported_color_modes = {ColorMode.RGB}
+            self._attr_color_mode = ColorMode.RGB
+        else:
+            self._attr_supported_color_modes = {ColorMode.BRIGHTNESS}
+            self._attr_color_mode = ColorMode.BRIGHTNESS
+
+    # ---------------------------------------------------------
+    #  DEVICE INFO (area support)
+    # ---------------------------------------------------------
+    @property
+    def device_info(self):
+        dev = self._cfg.get("device", {}) or {}
+
+        identifiers = dev.get("identifiers")
+        if isinstance(identifiers, list) and identifiers:
+            identifiers = {(DOMAIN, identifiers[0])}
+        else:
+            identifiers = {(DOMAIN, self._attr_unique_id)}
+
+        info = {
+            "identifiers": identifiers,
+            "name": dev.get("name", self._attr_name),
             "manufacturer": dev.get("manufacturer", "Lytiva"),
             "model": dev.get("model", "Light"),
-            "name": dev.get("name", self._attr_name),
-            "suggested_area": dev.get("suggested_area"),
         }
 
-        # LIGHT TYPE DETECTION
-        self.light_type = config.get("type", "dimmer")
-        if "color_temp_command_topic" in config or self.light_type == "cct":
-            self.light_type = "cct"
-        elif "rgb_command_topic" in config or self.light_type == "rgb":
-            self.light_type = "rgb"
-        elif self.light_type == "dimmer":
-            self.light_type = "dimmer"
-        else:
-            self.light_type = "switch"
+        if dev.get("suggested_area"):
+            info["suggested_area"] = dev["suggested_area"]
 
-        # COLOR MODE SETUP
-        if self.light_type == "cct":
-            # Use COLOR_TEMP as main mode. We include BRIGHTNESS flag for dimming support.
-            self._attr_color_mode = ColorMode.COLOR_TEMP
-            self._attr_supported_color_modes = {ColorMode.COLOR_TEMP, ColorMode.BRIGHTNESS}
-        elif self.light_type == "rgb":
-            self._attr_color_mode = ColorMode.RGB
-            self._attr_supported_color_modes = {ColorMode.RGB}
-        elif self.light_type == "dimmer":
-            self._attr_color_mode = ColorMode.BRIGHTNESS
-            self._attr_supported_color_modes = {ColorMode.BRIGHTNESS}
-        else:
-            self._attr_color_mode = ColorMode.BRIGHTNESS
-            self._attr_supported_color_modes = {ColorMode.BRIGHTNESS}
+        return info
 
-        # optimistic: we will still update from real state messages
-        self._optimistic = True
-
-    #
-    # -------- MQTT PUBLISH --------
-    #
+    # ---------------------------------------------------------
+    #  MQTT PUBLISH
+    # ---------------------------------------------------------
     def _publish(self, payload):
         try:
-            if not self.command_topic:
-                _LOGGER.warning("No command_topic for %s, can't publish", self._attr_name)
-                return
-            self._mqtt.publish(self.command_topic, json.dumps(payload))
+            mqtt = self.hass.data[DOMAIN][self._entry.entry_id]["mqtt_client"]
+            mqtt.publish(self.command_topic, json.dumps(payload))
         except Exception as e:
-            _LOGGER.error("MQTT publish failed: %s", e)
+            _LOGGER.error("Light MQTT publish error: %s", e)
 
-    #
-    # -------- TURN ON / OFF --------
-    #
+    # ---------------------------------------------------------
+    #  TURN ON
+    # ---------------------------------------------------------
     async def async_turn_on(self, **kwargs):
         payload = {"version": "v1.0", "address": self.address}
 
         if self.light_type == "dimmer":
-            brightness = kwargs.get(ATTR_BRIGHTNESS, self._attr_brightness)
-            dim = int(brightness / 255 * 100)
-            payload.update({"type": "dimmer", "dimming": dim})
-            self._attr_brightness = brightness
+            b = kwargs.get(ATTR_BRIGHTNESS, self._attr_brightness)
+            self._attr_brightness = b
+            payload.update({"type": "dimmer", "dimming": int(b * 100 / 255)})
 
         elif self.light_type == "cct":
-            brightness = kwargs.get(ATTR_BRIGHTNESS, self._attr_brightness)
-            color_temp = kwargs.get(ATTR_COLOR_TEMP, self._attr_color_temp)
+            b = kwargs.get(ATTR_BRIGHTNESS, self._attr_brightness)
+            t = kwargs.get(ATTR_COLOR_TEMP, self._attr_color_temp)
+            self._attr_brightness = b
+            self._attr_color_temp = t
 
-            dim = int(brightness / 255 * 100)
-            # scale color_temp (mireds) into percent similar to your JS (inverse)
-            try:
-                ct_scaled = int(
-                    (color_temp - self._attr_min_mireds)
-                    * 100 / (self._attr_max_mireds - self._attr_min_mireds)
-                )
-                ct_scaled = 100 - ct_scaled
-            except Exception:
-                ct_scaled = 50
+            dim = int(b * 100 / 255)
+            ct_scaled = int((t - self._attr_min_mireds) * 100 /
+                            (self._attr_max_mireds - self._attr_min_mireds))
+            ct_scaled = 100 - ct_scaled
 
-            payload.update({"type": "cct", "dimming": dim, "color_temperature": ct_scaled})
-            self._attr_brightness = brightness
-            self._attr_color_temp = color_temp
+            payload.update({
+                "type": "cct",
+                "dimming": dim,
+                "color_temperature": ct_scaled
+            })
 
         elif self.light_type == "rgb":
             r, g, b = kwargs.get(ATTR_RGB_COLOR, self._attr_rgb_color)
-            payload.update({"type": "rgb", "r": int(r), "g": int(g), "b": int(b)})
-            self._attr_rgb_color = [int(r), int(g), int(b)]
-
-        else:
-            payload.update({"type": "switch", "power": True})
+            self._attr_rgb_color = [r, g, b]
+            payload.update({"type": "rgb", "r": r, "g": g, "b": b})
 
         self._attr_is_on = True
         self._publish(payload)
         self.async_write_ha_state()
 
+    # ---------------------------------------------------------
+    #  TURN OFF
+    # ---------------------------------------------------------
     async def async_turn_off(self, **kwargs):
         payload = {"version": "v1.0", "address": self.address}
 
         if self.light_type == "dimmer":
             payload.update({"type": "dimmer", "dimming": 0})
-            self._attr_brightness = 0
 
         elif self.light_type == "cct":
             payload.update({"type": "cct", "dimming": 0, "color_temperature": 0})
-            self._attr_brightness = 0
 
         elif self.light_type == "rgb":
             payload.update({"type": "rgb", "r": 0, "g": 0, "b": 0})
-            self._attr_rgb_color = [0, 0, 0]
-
-        else:
-            payload.update({"type": "switch", "power": False})
 
         self._attr_is_on = False
         self._publish(payload)
         self.async_write_ha_state()
 
-    #
-    # -------- STATUS UPDATE FROM DEVICE / GROUP --------
-    #
+    # ---------------------------------------------------------
+    #  UPDATE FROM DEVICE PAYLOAD
+    # ---------------------------------------------------------
     async def _update_from_payload(self, payload):
         try:
-            # DIMMER
+            if payload.get("address") != self.address:
+                return
+
             if self.light_type == "dimmer":
-                dim = None
-                if "dimmer" in payload:
-                    dim = payload["dimmer"].get("dimming")
-                elif "dimming" in payload:
-                    dim = payload.get("dimming")
+                d = payload.get("dimmer", {}).get("dimming") or payload.get("dimming")
+                if d is not None:
+                    self._attr_brightness = int(d * 255 / 100)
+                    self._attr_is_on = d > 0
 
-                if dim is not None:
-                    self._attr_brightness = int(dim * 255 / 100)
-                    self._attr_is_on = dim > 0
+            elif self.light_type == "cct":
+                c = payload.get("cct")
+                if isinstance(c, dict):
+                    d = c.get("dimming")
+                    t = c.get("color_temperature")
 
-            # CCT
-            elif self.light_type == "cct" and "cct" in payload:
-                cct = payload["cct"]
-                dim = cct.get("dimming")
-                ct = cct.get("color_temperature")
+                    if d is not None:
+                        self._attr_brightness = int(d * 255 / 100)
+                        self._attr_is_on = d > 0
 
-                if dim is not None:
-                    self._attr_brightness = int(dim * 255 / 100)
-                    self._attr_is_on = dim > 0
-
-                if ct is not None:
-                    # JS mapping: device percent -> mired range
-                    try:
+                    if t is not None:
                         self._attr_color_temp = round(
-                            self._attr_max_mireds
-                            - (ct * (self._attr_max_mireds - self._attr_min_mireds) / 100)
+                            self._attr_max_mireds -
+                            (t * (self._attr_max_mireds - self._attr_min_mireds) / 100)
                         )
-                    except Exception:
-                        pass
 
-            # RGB
-            elif self.light_type == "rgb" and "rgb" in payload:
-                rgb = payload["rgb"]
-                self._attr_rgb_color = [
-                    rgb.get("r", 0),
-                    rgb.get("g", 0),
-                    rgb.get("b", 0),
-                ]
-                self._attr_is_on = any(self._attr_rgb_color)
-
-            # SWITCH / fallback
-            else:
-                power = None
-                # group switch may put switch.power or top-level power
-                if "switch" in payload and isinstance(payload["switch"], dict):
-                    power = payload["switch"].get("power")
-                if power is None:
-                    power = payload.get("power")
-                if power is not None:
-                    self._attr_is_on = bool(power)
+            elif self.light_type == "rgb":
+                rgb = payload.get("rgb")
+                if isinstance(rgb, dict):
+                    r = rgb.get("r", 0)
+                    g = rgb.get("g", 0)
+                    b = rgb.get("b", 0)
+                    self._attr_rgb_color = [r, g, b]
+                    self._attr_is_on = any([r, g, b])
 
             self.async_write_ha_state()
 
         except Exception as e:
-            _LOGGER.exception("Error updating light %s from payload: %s", self._attr_name, e)
+            _LOGGER.exception("Light update error: %s", e)
