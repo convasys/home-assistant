@@ -1,141 +1,164 @@
-"""Support for Lytiva switches via MQTT."""
+"""Lytiva switches via MQTT (live updates + HA compatible + group support)."""
 from __future__ import annotations
 import logging
 import json
+from typing import Any, Dict
 
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+
+from . import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
-DOMAIN = "lytiva"
 
-async def async_setup_entry(
-    hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
-) -> None:
-    """Set up Lytiva switches."""
-    entry_data = hass.data[DOMAIN][config_entry.entry_id]
-    mqtt = entry_data["mqtt_client"]
-    discovery_prefix = entry_data["discovery_prefix"]
 
-    def on_switch_discovery(client, userdata, message):
-        """Handle switch discovery."""
-        try:
-            payload = json.loads(message.payload.decode())
-            unique_id = payload.get("unique_id")
+# ---------------------------------------------------------
+#  REGISTER DISCOVERY CALLBACK
+# ---------------------------------------------------------
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
+    data = hass.data[DOMAIN][entry.entry_id]
+    register_cb = data.get("register_switch_callback")
 
-            if not unique_id:
-                return
+    if register_cb:
+        register_cb(lambda payload: _handle_discovery(hass, entry, payload, async_add_entities))
+        _LOGGER.debug("Lytiva Switch: discovery callback registered.")
 
-            # Check if already added
-            if unique_id in entry_data["devices"]:
-                return
 
-            # Create switch
-            switch = LytivaSwitch(hass, payload, mqtt, config_entry.entry_id)
-            entry_data["devices"][unique_id] = switch
+# ---------------------------------------------------------
+#  DISCOVERY HANDLER
+# ---------------------------------------------------------
+def _handle_discovery(hass, entry, payload, async_add_entities):
+    try:
+        uid = payload.get("unique_id") or payload.get("address")
+        if uid is None:
+            return
 
-            # Add to HA
-            hass.add_job(async_add_entities, [switch])
-            _LOGGER.info("Discovered Lytiva switch: %s", payload.get("name"))
-        except Exception as e:
-            _LOGGER.error("Error discovering switch: %s", e)
+        uid = str(uid)
 
-    mqtt.message_callback_add(f"{discovery_prefix}/switch/+/config", on_switch_discovery)
+        # FIX: If address missing, use unique_id
+        if "address" not in payload or payload.get("address") is None:
+            payload["address"] = uid
 
+        store = hass.data[DOMAIN][entry.entry_id]
+        by_uid = store["entities_by_unique_id"]
+        by_addr = store["entities_by_address"]
+
+        # Duplicate check
+        if uid in by_uid:
+            return
+        if str(payload["address"]) in by_addr:
+            return
+
+        ent = LytivaSwitch(hass, entry, payload)
+        by_uid[uid] = ent
+        by_addr[str(ent.address)] = ent
+
+        # Register MQTT live update
+        mqtt = store.get("mqtt_client")
+        if mqtt:
+            topic = payload.get("status_topic")
+            if topic:
+                mqtt.subscribe(topic, lambda msg: hass.add_job(ent._update_from_payload, msg))
+
+        hass.add_job(async_add_entities, [ent])
+
+    except Exception as e:
+        _LOGGER.exception("Lytiva Switch discovery failed: %s", e)
+
+
+# ---------------------------------------------------------
+#  SWITCH ENTITY
+# ---------------------------------------------------------
 class LytivaSwitch(SwitchEntity):
     """Representation of a Lytiva Switch."""
 
-    def __init__(self, hass: HomeAssistant, config: dict, mqtt, entry_id: str) -> None:
-        """Initialize the switch."""
+    def __init__(self, hass, entry, cfg):
         self.hass = hass
-        self._config = config
-        self._mqtt = mqtt
-        self._attr_name = config.get("name", "Lytiva Switch")
-        self._attr_unique_id = f"lytiva_{config.get('unique_id')}"
-        self._attr_is_on = False
-        self._value_template_str = config.get("value_template")
-        self._payload_on = config.get("payload_on")
-        self._payload_off = config.get("payload_off")
-        self._state_on = config.get("state_on", "ON")
-        self._state_off = config.get("state_off", "OFF")
-        self._state_topic = config.get("state_topic")
-        self._command_topic = config.get("command_topic")
-        self._icon = config.get("icon", "mdi:toggle-switch")
+        self._entry = entry
+        self._cfg = cfg or {}
 
-        # Device info - EXACTLY like lights
-        device_info = config.get("device", {})
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, str(device_info.get("identifiers", [self._attr_unique_id])[0]))},
-            "name": device_info.get("name", self._attr_name),
-            "manufacturer": device_info.get("manufacturer", "Lytiva"),
-            "model": device_info.get("model", "Switch"),
-            "suggested_area": device_info.get("suggested_area"),
+        # Identity
+        self._attr_name = cfg.get("name", "Lytiva Switch")
+        self._attr_unique_id = str(cfg.get("unique_id") or cfg.get("address"))
+
+        # Address
+        addr = cfg.get("address") or self._attr_unique_id
+        try:
+            self.address = int(addr)
+        except Exception:
+            self.address = addr
+
+        self.command_topic = cfg.get("command_topic")
+        self._attr_is_on = False
+
+    # ---------------------------------------------------------
+    #  DEVICE INFO (area support)
+    # ---------------------------------------------------------
+    @property
+    def device_info(self):
+        dev = self._cfg.get("device", {}) or {}
+        identifiers = dev.get("identifiers")
+        if isinstance(identifiers, list) and identifiers:
+            identifiers = {(DOMAIN, identifiers[0])}
+        else:
+            identifiers = {(DOMAIN, self._attr_unique_id)}
+
+        info = {
+            "identifiers": identifiers,
+            "name": dev.get("name", self._attr_name),
+            "manufacturer": dev.get("manufacturer", "Lytiva"),
+            "model": dev.get("model", "Switch"),
         }
 
-    @property
-    def icon(self):
-        return self._icon
+        if dev.get("suggested_area"):
+            info["suggested_area"] = dev["suggested_area"]
 
-    @property
-    def is_on(self):
-        return self._attr_is_on
+        return info
 
-    async def async_added_to_hass(self) -> None:
-        """Subscribe to MQTT topics."""
-        def on_state_message(client, userdata, message):
-            """Handle state messages."""
-            try:
-                payload = message.payload.decode()
+    # ---------------------------------------------------------
+    #  MQTT PUBLISH
+    # ---------------------------------------------------------
+    def _publish(self, payload):
+        try:
+            mqtt = self.hass.data[DOMAIN][self._entry.entry_id]["mqtt_client"]
+            mqtt.publish(self.command_topic, json.dumps(payload))
+        except Exception as e:
+            _LOGGER.error("Switch MQTT publish error: %s", e)
 
-                # If there's a value_template, render it
-                if self._value_template_str:
-                    try:
-                        payload_json = json.loads(payload)
-                        from homeassistant.helpers.template import Template
-                        template = Template(self._value_template_str, self.hass)
-                        value = template.async_render({"value_json": payload_json}, parse_result=False)
-                    except Exception as e:
-                        _LOGGER.error("Template error for %s: %s", self._attr_name, e)
-                        value = payload
-                else:
-                    value = payload
-
-                # Check state
-                if str(value).strip() == self._state_on:
-                    self._attr_is_on = True
-                elif str(value).strip() == self._state_off:
-                    self._attr_is_on = False
-
-                self.schedule_update_ha_state()
-
-            except Exception as e:
-                _LOGGER.error("Error processing state for %s: %s", self._attr_name, e)
-
-        state_topic = self._config.get("state_topic")
-        if state_topic:
-            self._mqtt.message_callback_add(state_topic, on_state_message)
-            await self.hass.async_add_executor_job(self._mqtt.subscribe, state_topic)
-
-    async def async_turn_on(self, **kwargs) -> None:
-        """Turn the switch on."""
-        await self.hass.async_add_executor_job(
-            self._mqtt.publish,
-            self._command_topic,
-            self._payload_on
-        )
+    # ---------------------------------------------------------
+    #  TURN ON / OFF
+    # ---------------------------------------------------------
+    async def async_turn_on(self, **kwargs):
+        payload = json.loads(self._cfg.get("payload_on") or {"address":54058,"type":"switch","power":true,"version":"v1.0"})
         self._attr_is_on = True
+        self._publish(payload)
         self.async_write_ha_state()
 
-    async def async_turn_off(self, **kwargs) -> None:
-        """Turn the switch off."""
-        await self.hass.async_add_executor_job(
-            self._mqtt.publish,
-            self._command_topic,
-            self._payload_off
-        )
+
+    async def async_turn_off(self, **kwargs):
+        payload = json.loads(self._cfg.get("payload_off") or {"address":54058,"type":"switch","power":false,"version":"v1.0"})
         self._attr_is_on = False
+        self._publish(payload)
         self.async_write_ha_state()
+
+
+    # ---------------------------------------------------------
+    #  UPDATE FROM DEVICE PAYLOAD
+    # ---------------------------------------------------------
+    async def _update_from_payload(self, payload):
+        """Update switch state from device MQTT payload."""
+        try:
+            if payload.get("address") != self.address:
+                return
+
+            # Extract state from nested "switch" object
+            sw = payload.get("switch", {})
+            power = sw.get("power")
+            if power is not None:
+                self._attr_is_on = bool(power)
+
+            self.async_write_ha_state()
+
+        except Exception as e:
+            _LOGGER.exception("Switch update error: %s", e)

@@ -17,7 +17,13 @@ DOMAIN = "lytiva"
 # default platforms the integration may forward to
 PLATFORMS = [
     "light",
-    "cover"
+    "cover",
+    "switch",
+    "fan",
+    "sensor",
+    "binary_sensor",
+    "climate",
+    "scene"
 ]
 
 
@@ -57,7 +63,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "climate_callbacks": [],
         "fan_callbacks": [],
         "light_callbacks": [],
+        "switch_callbacks": [],
+        "sensor_callbacks": [],
+        "binary_sensor_callbacks": [],
         "other_callbacks": [],
+        
     }
 
     # Helper: registration functions for platforms to register discovery callback
@@ -73,6 +83,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     def register_light_callback(callback: Callable[[dict], None]) -> None:
         hass.data[DOMAIN][entry.entry_id]["light_callbacks"].append(callback)
 
+    def register_switch_callback(callback: Callable[[dict], None]) -> None:
+        hass.data[DOMAIN][entry.entry_id]["switch_callbacks"].append(callback)
+
+    def register_sensor_callback(callback: Callable[[dict], None]) -> None:
+        hass.data[DOMAIN][entry.entry_id]["sensor_callbacks"].append(callback)
+
+    def register_binary_sensor_callback(callback: Callable[[dict], None]) -> None:
+        hass.data[DOMAIN][entry.entry_id]["binary_sensor_callbacks"].append(callback)
+    
     def register_other_callback(callback: Callable[[dict], None]) -> None:
         hass.data[DOMAIN][entry.entry_id]["other_callbacks"].append(callback)
 
@@ -81,6 +100,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN][entry.entry_id]["register_climate_callback"] = register_climate_callback
     hass.data[DOMAIN][entry.entry_id]["register_fan_callback"] = register_fan_callback
     hass.data[DOMAIN][entry.entry_id]["register_light_callback"] = register_light_callback
+    hass.data[DOMAIN][entry.entry_id]["register_switch_callback"] = register_switch_callback
+    hass.data[DOMAIN][entry.entry_id]["register_sensor_callback"] = register_sensor_callback
+    hass.data[DOMAIN][entry.entry_id]["register_binary_sensor_callback"] = register_sensor_callback
     hass.data[DOMAIN][entry.entry_id]["register_other_callback"] = register_other_callback
 
     #
@@ -212,6 +234,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     hass.loop.call_soon_threadsafe(cb, payload)
             elif platform == "light":
                 for cb in list(hass.data[DOMAIN][entry.entry_id]["light_callbacks"]):
+                    hass.loop.call_soon_threadsafe(cb, payload)
+            elif platform == "switch":
+                for cb in list(hass.data[DOMAIN][entry.entry_id]["switch_callbacks"]):
+                    hass.loop.call_soon_threadsafe(cb, payload)
+            elif platform == "switch":
+                for cb in list(hass.data[DOMAIN][entry.entry_id]["switch_callbacks"]):
+                    hass.loop.call_soon_threadsafe(cb, payload)
+            elif platform == "sensor":
+                for cb in list(hass.data[DOMAIN][entry.entry_id]["sensor_callbacks"]):
+                    hass.loop.call_soon_threadsafe(cb, payload)
+            elif platform == "binary_sensor":
+                for cb in list(hass.data[DOMAIN][entry.entry_id]["binary_sensor_callbacks"]):
                     hass.loop.call_soon_threadsafe(cb, payload)
             else:
                 # call any other registered callbacks

@@ -1,4 +1,4 @@
-"""Lytiva fan integration with fully working ON/OFF buttons and slider."""
+"""Lytiva Fan integration with live updates and HA-compatible control."""
 from __future__ import annotations
 import json
 import logging
@@ -13,36 +13,38 @@ from . import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
-    mqtt = hass.data[DOMAIN][entry.entry_id]["mqtt_client"]
-    devices = hass.data[DOMAIN][entry.entry_id]["devices"]
 
-    def add_new_fan(device):
-        ent = LytivaFan(device, mqtt)
-        async_add_entities([ent], True)
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
+    """Set up Lytiva fans from discovery or stored devices."""
+    data = hass.data[DOMAIN][entry.entry_id]
+    mqtt = data["mqtt_client"]
+    devices = data.get("devices", {})
+
+    def add_fan(device):
+        ent = LytivaFan(hass, entry, device)
+        async_add_entities([ent])
         _LOGGER.info("✅ Lytiva fan added: %s (Address: %s)", device.get("name"), device.get("unique_id"))
 
-    register = hass.data[DOMAIN][entry.entry_id].get("register_fan_callback")
-    if register:
-        register(add_new_fan)
+    register_cb = data.get("register_fan_callback")
+    if register_cb:
+        register_cb(add_fan)
 
+    # Add already known devices
     for dev in devices.values():
         if isinstance(dev, dict) and ("fan" in dev.get("name", "").lower() or dev.get("device_class") == "fan"):
-            add_new_fan(dev)
+            add_fan(dev)
 
 
 class LytivaFan(FanEntity):
-    """Lytiva fan via MQTT with proper ON/OFF support."""
+    """Lytiva fan entity with live updates."""
 
-    _attr_supported_features = (
-        FanEntityFeature.SET_SPEED
-        | FanEntityFeature.TURN_ON
-        | FanEntityFeature.TURN_OFF
-    )
+    _attr_supported_features = FanEntityFeature.SET_SPEED | FanEntityFeature.TURN_ON | FanEntityFeature.TURN_OFF
 
-    def __init__(self, device: dict[str, Any], mqtt_client):
+    def __init__(self, hass, entry, device: dict[str, Any]):
+        self.hass = hass
+        self._entry = entry
         self._device = device
-        self._mqtt = mqtt_client
+        self._mqtt = hass.data[DOMAIN][entry.entry_id]["mqtt_client"]
 
         self._name = device.get("name")
         self._unique_id = str(device.get("unique_id") or device.get("address"))
@@ -56,6 +58,7 @@ class LytivaFan(FanEntity):
         self._model = dev_meta.get("model", "Fan")
         self._area = dev_meta.get("suggested_area")
 
+        # Internal state
         self._available = True
         self._speed = 0
         self._percentage = 0
@@ -64,6 +67,9 @@ class LytivaFan(FanEntity):
 
         self._subscribe_state()
 
+    # ---------------------------------------------------------
+    #  MQTT STATUS SUBSCRIPTION
+    # ---------------------------------------------------------
     def _subscribe_state(self):
         if not self._state_topic:
             return
@@ -74,14 +80,15 @@ class LytivaFan(FanEntity):
                 if payload.get("address") != self._address:
                     return
 
-                speed = payload.get("fan", {}).get("fan_speed", payload.get("fan_speed"))
+                fan_data = payload.get("fan", {})
+                speed = fan_data.get("fan_speed", payload.get("fan_speed"))
                 if speed is not None:
                     speed = max(0, min(4, int(speed)))
                     self._speed = speed
                     self._percentage = speed * 25
                     if speed > 0:
                         self._last_speed = speed
-                    self._is_on = self._speed > 0
+                    self._is_on = speed > 0
                     self._available = True
                     self.schedule_update_ha_state()
             except Exception as e:
@@ -91,6 +98,9 @@ class LytivaFan(FanEntity):
         self._mqtt.subscribe(self._state_topic)
         _LOGGER.debug("Subscribed to fan state topic: %s", self._state_topic)
 
+    # ---------------------------------------------------------
+    #  HA PROPERTIES
+    # ---------------------------------------------------------
     @property
     def name(self):
         return self._name
@@ -127,42 +137,36 @@ class LytivaFan(FanEntity):
     def speed_count(self):
         return 4
 
-    async def async_turn_on(self, percentage: int | None = None, preset_mode: str | None = None, **kwargs):
-        """Turn on fan using last speed or provided percentage."""
-        speed_to_use = self._last_speed if self._last_speed > 0 else 3
+    # ---------------------------------------------------------
+    #  CONTROL METHODS
+    # ---------------------------------------------------------
+    async def async_turn_on(self, percentage: int | None = None, **kwargs):
+        """Turn on fan using last speed or percentage."""
+        speed = self._last_speed if self._last_speed > 0 else 3
         if percentage is not None:
-            speed_to_use = max(1, math.ceil(percentage / 25))
-
-        payload = {
-            "version": "v1.0",
-            "type": "fan",
-            "address": self._address,
-            "fan_speed": speed_to_use
-        }
-        self._mqtt.publish(self._command_topic, json.dumps(payload))
-
-        self._speed = speed_to_use
-        self._percentage = self._speed * 25
-        self._last_speed = self._speed
-        self._is_on = True
-        self.schedule_update_ha_state()
+            speed = max(1, math.ceil(percentage / 25))
+        await self._set_speed(speed)
 
     async def async_turn_off(self, **kwargs):
-        """Turn off fan via slider 0% hack."""
-        await self.async_set_percentage(0)
+        """Turn off fan via 0% speed."""
+        await self._set_speed(0)
 
-    async def async_set_percentage(self, percentage: int, **kwargs) -> None:
-        """Set fan speed; 0% turns it off."""
+    async def async_set_percentage(self, percentage: int, **kwargs):
+        """Set fan speed; 0 turns off."""
         percentage = max(0, min(100, percentage))
         speed = 0 if percentage == 0 else max(1, math.ceil(percentage / 25))
+        await self._set_speed(speed)
 
+    async def _set_speed(self, speed: int):
+        """Publish MQTT payload and update internal state."""
         payload = {
             "version": "v1.0",
             "type": "fan",
             "address": self._address,
             "fan_speed": speed
         }
-        self._mqtt.publish(self._command_topic, json.dumps(payload))
+        if self._command_topic:
+            self._mqtt.publish(self._command_topic, json.dumps(payload))
 
         self._speed = speed
         self._percentage = speed * 25
@@ -170,6 +174,9 @@ class LytivaFan(FanEntity):
         self._is_on = speed > 0
         self.schedule_update_ha_state()
 
+    # ---------------------------------------------------------
+    #  RESTORE OLD STATE
+    # ---------------------------------------------------------
     async def async_added_to_hass(self):
         old_state = self.hass.states.get(f"fan.{self._unique_id}")
         if old_state:
