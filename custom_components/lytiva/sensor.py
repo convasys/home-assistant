@@ -1,216 +1,128 @@
-"""Lytiva IR AC Climate via central MQTT STATUS updates."""
+"""Lytiva sensors via MQTT with live updates via central STATUS handler (generic)."""
 from __future__ import annotations
 import logging
 import json
-
-from homeassistant.components.climate import ClimateEntity, ClimateEntityFeature, HVACMode
-from homeassistant.const import UnitOfTemperature
+from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.restore_state import RestoreEntity
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-HVAC_MAP = {
-    "cool": HVACMode.COOL,
-    "heat": HVACMode.HEAT,
-    "dry": HVACMode.DRY,
-    "fan_only": HVACMode.FAN_ONLY,
-    "auto": HVACMode.AUTO,
-    "off": HVACMode.OFF,
+DEFAULT_ICONS = {
+    "temperature": "mdi:thermometer",
+    "humidity": "mdi:water-percent",
+    "co2": "mdi:molecule-co2",
+    "illuminance": "mdi:brightness-5",
+    "lux_levels": "mdi:brightness-5",
+    "default": "mdi:circle-outline",
 }
-REVERSE_HVAC = {v: k for k, v in HVAC_MAP.items()}
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
-    """Set up Lytiva climate devices via central integration."""
-    integration = hass.data[DOMAIN][entry.entry_id]
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
+    """Set up Lytiva sensors."""
+    store = hass.data[DOMAIN][entry.entry_id]
+    by_uid = store["entities_by_unique_id"]
+    by_addr = store["entities_by_address"]
 
-    # Add existing devices
-    entities = []
-    for device_id, payload in integration.get("devices", {}).items():
-        if payload.get("type") == "ir_ac" or payload.get("mode_state_topic"):
-            entities.append(LytivaClimateEntity(hass, entry, payload, integration))
-    if entities:
-        async_add_entities(entities, True)
+    # register callback
+    def _sensor_discovery(payload: dict):
+        uid = str(payload.get("unique_id") or payload.get("address"))
+        if uid in by_uid:
+            return
 
-    # Register callback to handle new devices dynamically
-    def register_callback(new_payload):
-        entity = LytivaClimateEntity(hass, entry, new_payload, integration)
-        async_add_entities([entity], True)
+        sensor = LytivaSensor(hass, entry.entry_id, payload)
+        by_uid[uid] = sensor
+        by_addr[str(sensor.address)] = sensor
 
-    register_fn = integration.get("register_climate_callback")
-    if register_fn:
-        register_fn(register_callback)
+        hass.add_job(async_add_entities, [sensor])
+        _LOGGER.info("Discovered Lytiva sensor: %s", sensor.name)
+
+    store.setdefault("sensor_callbacks", []).append(lambda payload: hass.async_create_task(_sensor_discovery(payload)))
+
+    # process already discovered payloads
+    for payload in store.get("discovered_payloads", {}).values():
+        hass.async_create_task(_sensor_discovery(payload))
 
 
-class LytivaClimateEntity(ClimateEntity, RestoreEntity):
-    """IR AC climate device that listens to central STATUS updates."""
+class LytivaSensor(SensorEntity):
+    """MQTT Sensor with live updates via central STATUS (generic)."""
 
-    def __init__(self, hass, entry, payload, integration):
+    def __init__(self, hass: HomeAssistant, entry_id: str, cfg: dict):
         self.hass = hass
-        self.entry = entry
-        self.payload = payload
-        self._integration = integration
+        self._entry_id = entry_id
+        self._cfg = cfg
+        self._state = None
+        self._attributes: dict = {}
 
-        self._name = payload.get("name", "Lytiva Climate")
-        self._unique_id = payload.get("unique_id") or f"lytiva_climate_{payload.get('address')}"
-        self._address = payload.get("address")
+        # Name & ID
+        self._attr_name = cfg.get("name", "Lytiva Sensor")
+        self._attr_unique_id = str(cfg.get("unique_id") or cfg.get("address"))
 
-        # Supported modes
-        modes = payload.get("modes", ["cool", "heat", "dry", "fan_only", "auto", "off"])
-        self._hvac_modes = [HVAC_MAP.get(m, HVACMode.OFF) for m in modes]
-        if HVACMode.OFF not in self._hvac_modes:
-            self._hvac_modes.append(HVACMode.OFF)
-
-        self._fan_modes = payload.get("fan_modes", ["Vlow", "Low", "Med", "High", "Top", "Auto"])
-        self._preset_modes = payload.get("preset_modes", ["On", "Off"])
-
-        self._manufacturer = payload.get("device", {}).get("manufacturer", "Lytiva")
-        self._model = payload.get("device", {}).get("model", "IR AC")
-
-        # Initial state
-        self._hvac_mode = HVACMode.OFF
-        self._target_temp = 24
-        self._current_temp = None
-        self._fan_mode = self._fan_modes[0]
-        self._preset = "Off"
-        self._available = True
-
-        self._min_temp = payload.get("min_temp", 16)
-        self._max_temp = payload.get("max_temp", 30)
-        self._temp_step = payload.get("temp_step", 1)
-
-        # Subscribe to central handler
-        self._integration.setdefault("climate_entities", []).append(self)
-
-        _LOGGER.info("✅ Climate initialized: %s (ID: %s)", self._name, self._unique_id)
-
-    @property
-    def name(self):
-        return self._name
-
-    @property
-    def unique_id(self):
-        return self._unique_id
-
-    @property
-    def available(self):
-        return self._available
-
-    @property
-    def hvac_modes(self):
-        return self._hvac_modes
-
-    @property
-    def hvac_mode(self):
-        return self._hvac_mode
-
-    @property
-    def fan_modes(self):
-        return self._fan_modes
-
-    @property
-    def fan_mode(self):
-        return self._fan_mode
-
-    @property
-    def preset_modes(self):
-        return self._preset_modes
-
-    @property
-    def preset_mode(self):
-        return self._preset
-
-    @property
-    def temperature_unit(self):
-        return UnitOfTemperature.CELSIUS
-
-    @property
-    def current_temperature(self):
-        return self._current_temp
-
-    @property
-    def target_temperature(self):
-        return self._target_temp
-
-    @property
-    def min_temp(self):
-        return self._min_temp
-
-    @property
-    def max_temp(self):
-        return self._max_temp
-
-    @property
-    def target_temperature_step(self):
-        return self._temp_step
-
-    @property
-    def supported_features(self):
-        features = ClimateEntityFeature.TARGET_TEMPERATURE
-        if self._fan_modes:
-            features |= ClimateEntityFeature.FAN_MODE
-        if self._preset_modes:
-            features |= ClimateEntityFeature.PRESET_MODE
-        return features
-
-    async def _update_from_status(self, status_payload: dict):
-        """Update climate state from central STATUS payload."""
+        # Address
         try:
-            if status_payload.get("address") != self._address:
+            self.address = int(cfg.get("address") or self._attr_unique_id)
+        except Exception:
+            self.address = self._attr_unique_id
+
+        self._device_class = cfg.get("device_class")
+        self._unit_of_measurement = cfg.get("unit_of_measurement")
+        self._icon = cfg.get("icon") or DEFAULT_ICONS.get(self._device_class, DEFAULT_ICONS["default"])
+
+        device_info = cfg.get("device", {})
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, str(device_info.get("identifiers", [self._attr_unique_id])[0]))},
+            "name": device_info.get("name", self._attr_name),
+            "manufacturer": device_info.get("manufacturer", "Lytiva"),
+            "model": device_info.get("model", "Sensor"),
+            "suggested_area": device_info.get("suggested_area", "Unknown"),
+        }
+
+    @property
+    def icon(self):
+        return self._icon
+
+    @property
+    def native_value(self):
+        return self._state
+
+    @property
+    def extra_state_attributes(self):
+        return self._attributes
+
+    @property
+    def native_unit_of_measurement(self):
+        return self._unit_of_measurement
+
+    @property
+    def device_class(self):
+        return self._device_class
+
+    async def _update_from_payload(self, payload: dict):
+        """Update sensor state from shared STATUS topic (generic)."""
+        try:
+            if str(payload.get("address")) != str(self.address):
                 return
 
-            ir = status_payload.get("ir_ac", {})
-            updated = False
+            # find the sensor subkey automatically (exclude standard keys)
+            standard_keys = {"version", "message", "type", "address"}
+            sensor_keys = [k for k in payload.keys() if k not in standard_keys]
 
-            # Power/preset
-            power = ir.get("power")
-            if power is not None:
-                self._preset = "On" if power else "Off"
-                updated = True
+            if not sensor_keys:
+                return
 
-            # Mode
-            mode = ir.get("mode")
-            if mode == "fan":
-                mode = "fan_only"
-            if mode in HVAC_MAP:
-                self._hvac_mode = HVAC_MAP[mode]
-                updated = True
+            sensor_data = payload.get(sensor_keys[0], {})  # e.g., "temperature_humidity_sensor", "co2_sensor", "lux_sensor"
 
-            # Target temperature
-            temp = ir.get("temperature")
-            if temp is not None:
-                self._target_temp = float(temp)
-                updated = True
+            # state: pick first numeric key as main state
+            numeric_keys = [k for k, v in sensor_data.items() if isinstance(v, (int, float))]
+            self._state = sensor_data.get(numeric_keys[0]) if numeric_keys else None
 
-            # Current temperature
-            current_temp = ir.get("current_temperature")
-            if current_temp is not None:
-                self._current_temp = float(current_temp)
-                updated = True
+            # attributes: all other keys
+            self._attributes = {k: v for k, v in sensor_data.items() if k != numeric_keys[0]} if numeric_keys else sensor_data
 
-            # Fan speed mapping
-            fan_speed = ir.get("fan_speed")
-            if fan_speed is not None:
-                mapping = {0: "Vlow", 1: "Low", 2: "Med", 3: "High", 4: "Top", 5: "Auto"}
-                self._fan_mode = mapping.get(fan_speed, self._fan_modes[0])
-                updated = True
+            self.async_write_ha_state()
 
-            if updated:
-                self._available = True
-                self.schedule_update_ha_state()
         except Exception as e:
-            _LOGGER.error("❌ Failed to update climate entity: %s", e, exc_info=True)
-
-    async def async_added_to_hass(self):
-        """Restore previous state when added to hass."""
-        await super().async_added_to_hass()
-        old_state = await self.async_get_last_state()
-        if old_state:
-            self._hvac_mode = HVACMode(old_state.state) if old_state.state in [m.value for m in HVACMode] else HVACMode.OFF
-            self._target_temp = float(old_state.attributes.get("temperature", self._target_temp))
-            self._fan_mode = old_state.attributes.get("fan_mode", self._fan_mode)
-            self._preset = old_state.attributes.get("preset_mode", self._preset)
+            _LOGGER.exception("Sensor update failed: %s", e)
