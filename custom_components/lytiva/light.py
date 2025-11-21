@@ -169,17 +169,17 @@ class LytivaLight(LightEntity):
         payload = {"version": "v1.0", "address": self.address}
 
         if self.light_type == "dimmer":
-            b = kwargs.get(ATTR_BRIGHTNESS, self._attr_brightness)
+            b = kwargs.get(ATTR_BRIGHTNESS, getattr(self, "_last_brightness", 255))
             self._attr_brightness = b
             payload.update({"type": "dimmer", "dimming": int(b * 100 / 255)})
 
         elif self.light_type == "cct":
-            b = kwargs.get(ATTR_BRIGHTNESS, self._attr_brightness)
-            t = kwargs.get(ATTR_COLOR_TEMP, self._attr_color_temp)
+            b = kwargs.get(ATTR_BRIGHTNESS, getattr(self, "_last_brightness", 255))
+            t = kwargs.get(ATTR_COLOR_TEMP, getattr(self, "_last_color_temp", self._attr_min_mireds))
             self._attr_brightness = b
             self._attr_color_temp = t
 
-            dim = int(b * 100 / 255)
+            dim = round(b * 100 / 255)
             ct_scaled = int((t - self._attr_min_mireds) * 100 /
                             (self._attr_max_mireds - self._attr_min_mireds))
             ct_scaled = 100 - ct_scaled
@@ -191,9 +191,10 @@ class LytivaLight(LightEntity):
             })
 
         elif self.light_type == "rgb":
-            r, g, b = kwargs.get(ATTR_RGB_COLOR, self._attr_rgb_color)
+            r, g, b = kwargs.get(ATTR_RGB_COLOR, getattr(self, "_last_rgb", [255, 255, 255]))
             self._attr_rgb_color = [r, g, b]
             payload.update({"type": "rgb", "r": r, "g": g, "b": b})
+
 
         self._attr_is_on = True
         self._publish(payload)
@@ -204,6 +205,11 @@ class LytivaLight(LightEntity):
     # ---------------------------------------------------------
     async def async_turn_off(self, **kwargs):
         payload = {"version": "v1.0", "address": self.address}
+
+        # store last state
+        self._last_brightness = self._attr_brightness
+        self._last_color_temp = self._attr_color_temp
+        self._last_rgb = self._attr_rgb_color.copy()
 
         if self.light_type == "dimmer":
             payload.update({"type": "dimmer", "dimming": 0})
@@ -229,7 +235,7 @@ class LytivaLight(LightEntity):
             if self.light_type == "dimmer":
                 d = payload.get("dimmer", {}).get("dimming") or payload.get("dimming")
                 if d is not None:
-                    self._attr_brightness = int(d * 255 / 100)
+                    self._attr_brightness = round(d * 255 / 100)
                     self._attr_is_on = d > 0
 
             elif self.light_type == "cct":
@@ -239,7 +245,7 @@ class LytivaLight(LightEntity):
                     t = c.get("color_temperature")
 
                     if d is not None:
-                        self._attr_brightness = int(d * 255 / 100)
+                        self._attr_brightness = round(d * 255 / 100)
                         self._attr_is_on = d > 0
 
                     if t is not None:

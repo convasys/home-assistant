@@ -171,14 +171,13 @@ class LytivaClimateEntity(ClimateEntity, RestoreEntity):
     # Central STATUS update
     # -----------------------------
     async def _update_from_payload(self, payload: dict):
-        """Update climate state from central STATUS payload."""
+        """Update climate state from central STATUS payload with unit handling."""
         try:
             # verify address matches
             if self._address is not None:
                 if str(payload.get("address")) != str(self._address):
                     return
 
-            # many IR AC device payloads use "ir_ac"
             ir_ac = payload.get("ir_ac") or payload.get("ir") or {}
             updated = False
 
@@ -193,10 +192,13 @@ class LytivaClimateEntity(ClimateEntity, RestoreEntity):
                         self._hvac_mode = new_mode
                         updated = True
 
-            # target temperature (often named "temperature")
+            # target temperature
             if "temperature" in ir_ac:
                 try:
                     t = float(ir_ac.get("temperature"))
+                    if t > 45:  # assume Fahrenheit
+                        t = (t - 32) * 5 / 9
+                    t = round(t, 1)
                     if t != self._target_temp:
                         self._target_temp = t
                         updated = True
@@ -207,18 +209,21 @@ class LytivaClimateEntity(ClimateEntity, RestoreEntity):
             if "current_temperature" in ir_ac:
                 try:
                     ct = float(ir_ac.get("current_temperature"))
+                    if ct > 45:
+                        ct = (ct - 32) * 5 / 9
+                    ct = round(ct, 1)
                     if ct != self._current_temp:
                         self._current_temp = ct
                         updated = True
                 except Exception:
                     pass
 
-            # fan speed -> fan_mode mapping
+            # fan speed mapping
             if "fan_speed" in ir_ac:
                 try:
                     fan_speed = int(ir_ac.get("fan_speed", 0))
                     mapping = {0: self._fan_modes[0] if self._fan_modes else None,
-                               1: "Vlow", 2: "Low", 3: "Med", 4: "High", 5: "Top", 6: "Auto"}
+                            1: "Vlow", 2: "Low", 3: "Med", 4: "High", 5: "Top", 6: "Auto"}
                     new_fan_mode = mapping.get(fan_speed, self._fan_modes[0] if self._fan_modes else None)
                     if new_fan_mode != self._fan_mode:
                         self._fan_mode = new_fan_mode
@@ -236,7 +241,6 @@ class LytivaClimateEntity(ClimateEntity, RestoreEntity):
 
             if updated:
                 self._available = True
-                # update HA state
                 try:
                     self.async_write_ha_state()
                 except Exception:
