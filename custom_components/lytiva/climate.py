@@ -196,9 +196,7 @@ class LytivaClimateEntity(ClimateEntity, RestoreEntity):
             if "temperature" in ir_ac:
                 try:
                     t = float(ir_ac.get("temperature"))
-                    if t > 45:  # assume Fahrenheit
-                        t = (t - 32) * 5 / 9
-                    t = round(t, 1)
+                    t = round(t, 1)  # no conversion, assume Celsius
                     if t != self._target_temp:
                         self._target_temp = t
                         updated = True
@@ -209,9 +207,7 @@ class LytivaClimateEntity(ClimateEntity, RestoreEntity):
             if "current_temperature" in ir_ac:
                 try:
                     ct = float(ir_ac.get("current_temperature"))
-                    if ct > 45:
-                        ct = (ct - 32) * 5 / 9
-                    ct = round(ct, 1)
+                    ct = round(ct, 1)  # no conversion, assume Celsius
                     if ct != self._current_temp:
                         self._current_temp = ct
                         updated = True
