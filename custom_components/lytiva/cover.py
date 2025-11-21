@@ -145,7 +145,11 @@ class LytivaCurtain(CoverEntity):
     # -----------------------------
     @property
     def device_info(self):
-        dev = self._cfg.get("device", {}) or {}
+        dev = self._cfg.get("device")
+
+        # If no device provided → DO NOT create a device entry
+        if not dev:
+            return None
 
         identifiers = dev.get("identifiers")
         if isinstance(identifiers, (list, tuple)) and identifiers:

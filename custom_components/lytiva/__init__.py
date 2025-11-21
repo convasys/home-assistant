@@ -102,7 +102,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN][entry.entry_id]["register_light_callback"] = register_light_callback
     hass.data[DOMAIN][entry.entry_id]["register_switch_callback"] = register_switch_callback
     hass.data[DOMAIN][entry.entry_id]["register_sensor_callback"] = register_sensor_callback
-    hass.data[DOMAIN][entry.entry_id]["register_binary_sensor_callback"] = register_sensor_callback
+    hass.data[DOMAIN][entry.entry_id]["register_binary_sensor_callback"] = register_binary_sensor_callback
     hass.data[DOMAIN][entry.entry_id]["register_other_callback"] = register_other_callback
 
     #
@@ -234,9 +234,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     hass.loop.call_soon_threadsafe(cb, payload)
             elif platform == "light":
                 for cb in list(hass.data[DOMAIN][entry.entry_id]["light_callbacks"]):
-                    hass.loop.call_soon_threadsafe(cb, payload)
-            elif platform == "switch":
-                for cb in list(hass.data[DOMAIN][entry.entry_id]["switch_callbacks"]):
                     hass.loop.call_soon_threadsafe(cb, payload)
             elif platform == "switch":
                 for cb in list(hass.data[DOMAIN][entry.entry_id]["switch_callbacks"]):

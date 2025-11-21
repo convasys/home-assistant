@@ -43,7 +43,7 @@ class LytivaFan(FanEntity):
     def __init__(self, hass, entry, device: dict[str, Any]):
         self.hass = hass
         self._entry = entry
-        self._device = device
+        self._device = device 
         self._mqtt = hass.data[DOMAIN][entry.entry_id]["mqtt_client"]
 
         self._name = device.get("name")
@@ -111,14 +111,24 @@ class LytivaFan(FanEntity):
 
     @property
     def device_info(self):
+        dev = self._device.get("device")
+        if not dev:  # Skip device creation for group entities
+            return None
+
+        identifiers = dev.get("identifiers")
+        if isinstance(identifiers, list) and identifiers:
+            identifiers = {(DOMAIN, identifiers[0])}
+        else:
+            identifiers = {(DOMAIN, self._unique_id)}
+
         info = {
-            "identifiers": {(DOMAIN, self._unique_id)},
-            "name": self._device.get("device", {}).get("name", self._name),
-            "manufacturer": self._manufacturer,
-            "model": self._model,
+            "identifiers": identifiers,
+            "name": dev.get("name", self._name),
+            "manufacturer": dev.get("manufacturer", "Lytiva"),
+            "model": dev.get("model", "Fan"),
         }
-        if self._area:
-            info["suggested_area"] = self._area
+        if dev.get("suggested_area"):
+            info["suggested_area"] = dev["suggested_area"]
         return info
 
     @property
@@ -140,12 +150,13 @@ class LytivaFan(FanEntity):
     # ---------------------------------------------------------
     #  CONTROL METHODS
     # ---------------------------------------------------------
-    async def async_turn_on(self, percentage: int | None = None, **kwargs):
+    async def async_turn_on(self, percentage: int | None = None, preset_mode: str | None = None, **kwargs):
         """Turn on fan using last speed or percentage."""
         speed = self._last_speed if self._last_speed > 0 else 3
         if percentage is not None:
             speed = max(1, math.ceil(percentage / 25))
         await self._set_speed(speed)
+
 
     async def async_turn_off(self, **kwargs):
         """Turn off fan via 0% speed."""

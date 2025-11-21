@@ -22,7 +22,6 @@ HVAC_MAP = {
     "dry": HVACMode.DRY,
     "fan_only": HVACMode.FAN_ONLY,
     "auto": HVACMode.AUTO,
-    "off": HVACMode.OFF,
 }
 REVERSE_HVAC = {v: k for k, v in HVAC_MAP.items()}
 
@@ -141,10 +140,8 @@ class LytivaClimateEntity(ClimateEntity, RestoreEntity):
         self._preset_mode_state_template = payload.get("preset_mode_state_template")
 
         # Supported values
-        modes = payload.get("modes", ["cool", "heat", "dry", "fan_only", "auto", "off"])
-        self._hvac_modes = [HVAC_MAP.get(m, HVACMode.OFF) for m in modes if m in HVAC_MAP]
-        if HVACMode.OFF not in self._hvac_modes:
-            self._hvac_modes.append(HVACMode.OFF)
+        modes = payload.get("modes", ["cool", "heat", "dry", "fan_only", "auto"])
+        self._hvac_modes = [HVAC_MAP.get(m) for m in modes if m in HVAC_MAP]
 
         self._fan_modes = payload.get("fan_modes", ["Vlow", "Low", "Med", "High", "Top", "Auto"])
         self._preset_modes = payload.get("preset_modes", ["On", "Off"])
@@ -160,8 +157,8 @@ class LytivaClimateEntity(ClimateEntity, RestoreEntity):
         self._target_temp = float(payload.get("min_temp", 24))
         self._current_temp = None
         self._fan_mode = self._fan_modes[0] if self._fan_modes else None
-        self._hvac_mode = HVACMode.OFF
-        self._preset = "Off"
+        self._hvac_mode = self._hvac_modes[0] if self._hvac_modes else HVACMode.COOL
+        self._preset = "On"
 
         # Temperature limits
         self._min_temp = payload.get("min_temp", 16)
@@ -325,12 +322,17 @@ class LytivaClimateEntity(ClimateEntity, RestoreEntity):
 
     @property
     def supported_features(self):
-        features = ClimateEntityFeature.TARGET_TEMPERATURE
+        features = ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE
         if self._fan_modes:
             features |= ClimateEntityFeature.FAN_MODE
-        if self._preset_modes:
-            features |= ClimateEntityFeature.PRESET_MODE
         return features
+
+    @property
+    def extra_state_attributes(self):
+        return {
+            "preset_mode": self._preset,
+            "fan_mode": self._fan_mode,
+        }
 
     # -----------------------------
     # control methods (use discovery templates/topics)
