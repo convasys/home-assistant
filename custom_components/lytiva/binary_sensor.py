@@ -54,6 +54,7 @@ class LytivaBinarySensor(BinarySensorEntity):
         self._entry_id = entry_id
         self._cfg = cfg
         self._state = None
+        self._attributes = {}
 
         # Name & ID
         self._attr_name = cfg.get("name", "Lytiva Binary Sensor")
@@ -91,6 +92,11 @@ class LytivaBinarySensor(BinarySensorEntity):
     @property
     def device_class(self):
         return self._device_class
+    
+    @property
+    def extra_state_attributes(self):
+        """Return additional attributes."""
+        return self._attributes
 
     async def _update_from_payload(self, payload: dict):
         """Update binary sensor state from STATUS payload (generic)."""
@@ -123,6 +129,11 @@ class LytivaBinarySensor(BinarySensorEntity):
 
             if value is not None:
                 self._state = value == str(self._payload_on).lower()
+
+            for k, v in sensor_data.items():
+                if k not in ("occupancy", "motion", "parking", "state"):
+                    self._attributes[k] = v
+
                 self.async_write_ha_state()
 
         except Exception as e:
