@@ -9,6 +9,8 @@ import paho.mqtt.client as mqtt_client
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_registry import async_get as async_get_entity_registry
+from homeassistant.helpers.device_registry import async_get as async_get_device_registry
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -203,6 +205,69 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             payload = json.loads(text)
         except Exception:
             _LOGGER.exception("Invalid discovery JSON on %s", getattr(message, "topic", "<unknown>"))
+            return
+
+        if payload == {}:
+            topic_parts = message.topic.split("/")
+            if len(topic_parts) >= 4:
+                platform = topic_parts[1]
+                object_id = topic_parts[2]
+
+                _LOGGER.warning(
+                    "Removing entity %s (platform %s) and its device immediately due to empty discovery payload.",
+                    object_id, platform
+                )
+
+                def remove_entity_and_device(hass: HomeAssistant, entry_id: str, object_id: str):
+                    """Remove an entity and its device safely from MQTT thread."""
+                    from homeassistant.helpers.entity_registry import async_get as async_get_entity_registry
+                    from homeassistant.helpers.device_registry import async_get as async_get_device_registry
+
+                    entity_registry = async_get_entity_registry(hass)
+                    device_registry = async_get_device_registry(hass)
+
+                    if entity_registry is None:
+                        _LOGGER.error("Entity registry not available")
+                        return
+                    if device_registry is None:
+                        _LOGGER.error("Device registry not available")
+                        return
+
+                    # Find the entity entry by unique_id
+                    entity_entry = None
+                    for entity_id, ent in list(entity_registry.entities.items()):
+                        if ent.unique_id == object_id:
+                            entity_entry = ent
+                            _LOGGER.warning("Removing entity registry entry: %s", entity_id)
+                            entity_registry.async_remove(entity_id)
+                            break
+
+                    # Remove the device if it has no other entities
+                    if entity_entry and entity_entry.device_id:
+                        device_id = entity_entry.device_id
+                        # get all entities linked to this device
+                        linked_entities = [
+                            e for e in entity_registry.entities.values() if e.device_id == device_id
+                        ]
+                        if len(linked_entities) == 0:
+                            try:
+                                _LOGGER.warning("Removing device: %s", device_id)
+                                device_registry.async_remove_device(device_id)
+                            except Exception as e:
+                                _LOGGER.error("Failed to remove device: %s", e)
+
+                    # Remove from integration caches
+                    data = hass.data[DOMAIN][entry_id]
+                    data["entities_by_unique_id"].pop(object_id, None)
+                    data["entities_by_address"].pop(object_id, None)
+                    data["discovered_payloads"].pop(object_id, None)
+
+                    _LOGGER.warning("Entity %s and its device removed fully.", object_id)
+
+                # Schedule safely from MQTT thread
+                hass.loop.call_soon_threadsafe(
+                    lambda: remove_entity_and_device(hass, entry.entry_id, object_id)
+                )
             return
 
         unique_id = payload.get("unique_id") or payload.get("uniqueId") or payload.get("uniqueid") or payload.get("address")
