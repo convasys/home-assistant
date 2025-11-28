@@ -107,6 +107,7 @@ class LytivaScene(Scene):
                 "name": self._device_info.get("name"),
                 "manufacturer": self._device_info.get("manufacturer", "Lytiva"),
                 "model": self._device_info.get("model", "Scene Controller"),
+                "suggested_area": self._device_info.get("suggested_area"),
             }
         return None
     
