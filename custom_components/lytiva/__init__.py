@@ -220,9 +220,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
                 def remove_entity_and_device(hass: HomeAssistant, entry_id: str, object_id: str):
                     """Remove an entity and its device safely from MQTT thread."""
-                    from homeassistant.helpers.entity_registry import async_get as async_get_entity_registry
-                    from homeassistant.helpers.device_registry import async_get as async_get_device_registry
-
                     entity_registry = async_get_entity_registry(hass)
                     device_registry = async_get_device_registry(hass)
 
@@ -232,15 +229,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     if device_registry is None:
                         _LOGGER.error("Device registry not available")
                         return
-
-                    # Find the entity entry by unique_id
+                    
+                    # Find the entity entry by checking all entities from this integration
                     entity_entry = None
                     for entity_id, ent in list(entity_registry.entities.items()):
-                        if ent.unique_id == object_id:
+                        if (ent.unique_id == object_id or 
+                            ent.unique_id == str(object_id) or
+                            ent.unique_id.endswith(f"_{object_id}") or
+                            ent.unique_id.endswith(f"_{str(object_id)}")):  
                             entity_entry = ent
                             _LOGGER.warning("Removing entity registry entry: %s", entity_id)
                             entity_registry.async_remove(entity_id)
                             break
+                    
+                    if not entity_entry:
+                        _LOGGER.error("Could not find entity with object_id %s in registry", object_id)
+                        # Still try to clean up internal caches
+                        data = hass.data[DOMAIN][entry_id]
+                        data["entities_by_unique_id"].pop(object_id, None)
+                        data["entities_by_unique_id"].pop(str(object_id), None)
+                        data["entities_by_address"].pop(object_id, None)
+                        data["entities_by_address"].pop(str(object_id), None)
+                        data["discovered_payloads"].pop(object_id, None)
+                        data["discovered_payloads"].pop(str(object_id), None)
+                        return
 
                     # Remove the device if it has no other entities
                     if entity_entry and entity_entry.device_id:
@@ -256,12 +268,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                             except Exception as e:
                                 _LOGGER.error("Failed to remove device: %s", e)
 
-                    # Remove from integration caches
+                    # Remove from integration caches (try multiple formats)
                     data = hass.data[DOMAIN][entry_id]
                     data["entities_by_unique_id"].pop(object_id, None)
+                    data["entities_by_unique_id"].pop(str(object_id), None)
                     data["entities_by_address"].pop(object_id, None)
+                    data["entities_by_address"].pop(str(object_id), None)
                     data["discovered_payloads"].pop(object_id, None)
-
+                    data["discovered_payloads"].pop(str(object_id), None)
                     _LOGGER.warning("Entity %s and its device removed fully.", object_id)
 
                 # Schedule safely from MQTT thread
