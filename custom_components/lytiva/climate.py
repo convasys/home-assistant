@@ -258,6 +258,17 @@ class LytivaClimateEntity(ClimateEntity, RestoreEntity):
 
     @property
     def device_info(self):
+        dev = self._cfg.get("device")
+        # If no device provided → DO NOT create a device entry
+        if not dev:
+            return None
+
+        identifiers = dev.get("identifiers")
+        if isinstance(identifiers, (list, tuple)) and identifiers:
+            identifiers = {(DOMAIN, identifiers[0])}
+        else:
+            identifiers = {(DOMAIN, self._attr_unique_id)}
+
         info = {
             "identifiers": {(DOMAIN, self._unique_id)},
             "name": self.payload.get("device", {}).get("name", self._name),
