@@ -90,23 +90,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     if register:
         register(add_new_climate)
 
-    # also add already discovered payloads (if any)
-    for payload in integration.get("discovered_payloads", {}).values():
-        # heuristics same as before
-        is_climate = (
-            payload.get("mode_state_topic")
-            or payload.get("device_class") == "climate"
-            or "climate" in str(payload.get("name", "")).lower()
-            or payload.get("modes")
-            or payload.get("temperature_command_topic")
-        )
-        if is_climate:
-            try:
-                add_new_climate(payload)
-            except Exception:
-                pass
-
-
 class LytivaClimateEntity(ClimateEntity, RestoreEntity):
     """Representation of IR AC (Air Conditioner) managed via central STATUS."""
 

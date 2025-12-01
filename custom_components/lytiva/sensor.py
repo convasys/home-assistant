@@ -42,11 +42,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 
     store.setdefault("sensor_callbacks", []).append(lambda payload: hass.async_create_task(_sensor_discovery(payload)))
 
-    # process already discovered payloads
-    for payload in store.get("discovered_payloads", {}).values():
-        hass.async_create_task(_sensor_discovery(payload))
-
-
 class LytivaSensor(SensorEntity):
     """MQTT Sensor with live updates via central STATUS (generic)."""
 

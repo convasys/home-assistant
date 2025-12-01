@@ -41,11 +41,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     # register callback
     store.setdefault("binary_sensor_callbacks", []).append(lambda payload: hass.async_create_task(add_binary_sensor(payload)))
 
-    # handle already discovered payloads
-    for payload in store.get("discovered_payloads", {}).values():
-        hass.async_create_task(add_binary_sensor(payload))
-
-
 class LytivaBinarySensor(BinarySensorEntity):
     """Generic binary sensor with live updates via central STATUS topic."""
 
