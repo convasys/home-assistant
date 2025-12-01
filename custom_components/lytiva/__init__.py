@@ -289,16 +289,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _LOGGER.debug("Discovery payload without unique id: %s", payload)
             return
 
-        unique_id = str(unique_id)
-        hass.data[DOMAIN][entry.entry_id]["discovered_payloads"][unique_id] = payload
-        _LOGGER.debug("Discovery payload stored for unique_id=%s", unique_id)
-
         # Determine platform from topic or payload
         topic_parts = message.topic.split("/") if message.topic else []
         platform = None
         # typical discovery topic: homeassistant/<platform>/<node>/<object>/config
         if len(topic_parts) >= 2:
             platform = topic_parts[1]
+
+        unique_id = str(unique_id)
+        # Store both payload and platform
+        hass.data[DOMAIN][entry.entry_id]["discovered_payloads"][unique_id] = {
+            "payload": payload,
+            "platform": platform
+        }
+        _LOGGER.debug("Discovery payload stored for unique_id=%s platform=%s", unique_id, platform)
 
         # Call appropriate callbacks (safe)
         try:
@@ -381,20 +385,51 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # After platforms are loaded, force-call callbacks for any already discovered payloads
     try:
-        discovered = list(hass.data[DOMAIN][entry.entry_id]["discovered_payloads"].values())
-        for payload in discovered:
-            topic_like = payload.get("discovery_topic") or ""
-            # attempt to infer platform from payload keys
-            # safe default: call light callbacks if it looks like a light
-            called = False
-            if "device_class" in payload and "cover" in str(payload.get("device_class","")).lower():
-                for cb in hass.data[DOMAIN][entry.entry_id]["cover_callbacks"]:
+        discovered_items = hass.data[DOMAIN][entry.entry_id]["discovered_payloads"].values()
+        for item in discovered_items:
+            # Check if we have the new structure with platform
+            if isinstance(item, dict) and "platform" in item and "payload" in item:
+                payload = item["payload"]
+                platform = item["platform"]
+            else:
+                # Fallback for old structure (should not happen after restart with new code, but good for safety)
+                payload = item
+                platform = None
+            
+            # Dispatch based on platform
+            if platform:
+                callbacks = []
+                if platform == "cover":
+                    callbacks = hass.data[DOMAIN][entry.entry_id]["cover_callbacks"]
+                elif platform == "climate":
+                    callbacks = hass.data[DOMAIN][entry.entry_id]["climate_callbacks"]
+                elif platform == "fan":
+                    callbacks = hass.data[DOMAIN][entry.entry_id]["fan_callbacks"]
+                elif platform == "light":
+                    callbacks = hass.data[DOMAIN][entry.entry_id]["light_callbacks"]
+                elif platform == "switch":
+                    callbacks = hass.data[DOMAIN][entry.entry_id]["switch_callbacks"]
+                elif platform == "sensor":
+                    callbacks = hass.data[DOMAIN][entry.entry_id]["sensor_callbacks"]
+                elif platform == "binary_sensor":
+                    callbacks = hass.data[DOMAIN][entry.entry_id]["binary_sensor_callbacks"]
+                else:
+                    callbacks = hass.data[DOMAIN][entry.entry_id]["other_callbacks"]
+                
+                for cb in callbacks:
                     hass.loop.call_soon_threadsafe(cb, payload)
-                    called = True
-            if not called and ("state_topic" in payload or "command_topic" in payload or "unique_id" in payload):
-                # heuristics - call light callbacks (platforms should validate)
-                for cb in hass.data[DOMAIN][entry.entry_id]["light_callbacks"]:
-                    hass.loop.call_soon_threadsafe(cb, payload)
+            else:
+                # Fallback heuristic (only if platform is missing)
+                called = False
+                if "device_class" in payload and "cover" in str(payload.get("device_class","")).lower():
+                    for cb in hass.data[DOMAIN][entry.entry_id]["cover_callbacks"]:
+                        hass.loop.call_soon_threadsafe(cb, payload)
+                        called = True
+                if not called and ("state_topic" in payload or "command_topic" in payload or "unique_id" in payload):
+                    # Default to light if we really don't know, but log a warning
+                    _LOGGER.warning("Discovered payload with no platform info, defaulting to light: %s", payload)
+                    for cb in hass.data[DOMAIN][entry.entry_id]["light_callbacks"]:
+                        hass.loop.call_soon_threadsafe(cb, payload)
     except Exception as e:
         _LOGGER.exception("Error during initial dispatch of discovered payloads: %s", e)
 
